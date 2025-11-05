@@ -1,0 +1,64 @@
+{
+    "input_directory": "C:\\Users\\sharm\\Downloads\\sftp_files",
+    "output_directory": "C:\\Users\\sharm\\Downloads\\sftp_files\\processed",
+    "supported_extensions": [".xlsx", ".xls", ".csv"],
+    "database": {
+        "host": "183.82.97.170",
+        "database": "ats",
+        "user": "ats",
+        "password": "cbwu+v6zq-9",
+        "port": 3306
+    },
+    "table_name": "PDF_Invoice_Details",
+    "column_mapping": {
+        "Airline PNR/Prov. Booking": "PNR_Number",
+        "Airline PNR": "PNR_Number",
+        "pnrnumber": "PNR_Number",
+        "pnr number": "PNR_Number",
+        "Airline Code": "Airline_Code",
+        "airlinecode": "Airline_Code",
+        "Sector": "Travel_Sector",
+        "trvael sector": "Travel_Sector",
+        "travelsector": "Travel_Sector",
+        "travel sector": "Travel_Sector"
+    },
+    "possible_reference_combinations": [
+        ["PNR_Number", "Airline_Code", "Travel_Sector"]
+    ],
+    "processing": {
+        "batch_size": 100,
+        "max_retries": 3,
+        "connection_timeout": 30,
+        "query_timeout": 10
+    },
+    "debug": {
+        "debug_mode": false,
+        "debug_id": null
+    },
+    "scheduling": {
+        "enabled": true,
+        "time": "13:05:00",
+        "timezone": "IST"
+    },
+    "paths": {
+        "working_directory": "C:\\Users\\sharm\\OneDrive\\Desktop\\DATA_MERGE6"
+  },
+  "sftp": {
+    "enabled": false,
+    "host": "",
+    "port": 22,
+    "username": "",
+    "password": "",
+    "remote_file_path": "",
+    "local_download_dir": "C:\\Users\\sharm\\Downloads\\sftp_files"
+  },
+  "email": {
+    "enabled": true,
+    "recipient_email": "katakamkumar8@gmail.com",
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "malleshkumar587@gmail.com",
+    "sender_password": "lqez wiqv zbhr dxlu",
+    "subject": "Data Merge Processing Report"
+  }
+}

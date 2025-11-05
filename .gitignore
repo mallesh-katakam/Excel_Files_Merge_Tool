@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive config (uncomment if you want to exclude config.json)
+# config.json
+
