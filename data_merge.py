@@ -602,7 +602,24 @@ class DataEnricher:
             return None
         
         # Define specific columns to fetch from database
-        target_columns = ['Taxable_Amount', 'NonTaxable_Amount', 'Cgst_Total', 'Sgst_Total', 'Igst_Total']
+        target_columns = [
+            'Taxable_Amount', 'NonTaxable_Amount', 'Cgst_Total', 'Sgst_Total', 'Igst_Total',
+            'Booking_Date', 'GST_Name', 'GST_Number', 'Invoice_Number', 'Invoice_Total_GST',
+            'Airline_Gst_Number', 'Airline_Gst_Name'
+        ]
+        
+        # Column rename mapping: database column name -> display name
+        column_rename_map = {
+            'Booking_Date': 'Booking Date',
+            'GST_Name': 'GST Name',
+            'GST_Number': 'GST Number',
+            'Invoice_Total_GST': 'TOTAL GST',
+            'Cgst_Total': 'CGST',
+            'Sgst_Total': 'SGST',
+            'Igst_Total': 'IGST',
+            'Airline_Gst_Number': 'Airline GST Number',
+            'Airline_Gst_Name': 'Airline GST Name'
+        }
         
         # Find which target columns are missing from Excel data
         missing_columns = [col for col in target_columns if col not in df_excel.columns]
@@ -652,12 +669,12 @@ class DataEnricher:
             unique_keys = list(dict.fromkeys(row_keys.values()))  # preserve first-seen order
 
             if unique_keys:
-                # 2) Build tuple IN query
+                # 2) Build tuple IN query - only fetch missing columns for efficiency
                 ref_cols_str = ', '.join([f"`{c}`" for c in reference_columns])
-                target_columns_str = ', '.join([f"`{col}`" for col in target_columns])
+                missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
                 placeholders = ', '.join(["(" + ", ".join(["%s"] * len(reference_columns)) + ")" for _ in unique_keys])
                 query = (
-                    f"SELECT {ref_cols_str}, {target_columns_str} "
+                    f"SELECT {ref_cols_str}, {missing_columns_str} "
                     f"FROM `{table_name}` "
                     f"WHERE ({ref_cols_str}) IN ({placeholders})"
                 )
@@ -670,7 +687,7 @@ class DataEnricher:
                 for r in results:
                     key = tuple(r[c] for c in reference_columns)
                     if key not in lookup:
-                        lookup[key] = {col: r.get(col) for col in target_columns}
+                        lookup[key] = {col: r.get(col) for col in missing_columns}
 
             else:
                 lookup = {}
@@ -700,9 +717,23 @@ class DataEnricher:
         # Create final DataFrame
         df_enriched = pd.DataFrame(enriched_data)
         
-        # Reorder columns - use original Excel column names + missing target columns
+        # Apply column rename mapping for display names (only for columns that exist)
+        # This needs to be done before final column ordering
+        rename_dict = {db_col: display_name for db_col, display_name in column_rename_map.items() 
+                      if db_col in df_enriched.columns}
+        if rename_dict:
+            df_enriched = df_enriched.rename(columns=rename_dict)
+            logger.info(f"Renamed columns: {rename_dict}")
+        
+        # Build final column order with renamed column names
+        # Map missing columns to their display names if they were renamed
+        missing_columns_display = [
+            rename_dict.get(col, col) for col in missing_columns
+        ]
+        
+        # Reorder columns - use original Excel column names + missing target columns (with display names)
         # (Unnamed columns already removed during file reading)
-        final_column_order = list(df_excel.columns) + missing_columns
+        final_column_order = list(df_excel.columns) + missing_columns_display
         df_enriched = df_enriched[final_column_order]
         
         # Summary
