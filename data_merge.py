@@ -21,6 +21,7 @@ from email import encoders
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from data_splitter import split_by_vendor_k3_amount
 
 # Configure enhanced logging for automated execution
 log_file = f"data_merge_{datetime.now().strftime('%Y%m%d')}.log"
@@ -223,16 +224,31 @@ class DataEnricher:
         """
         try:
             file_extension = os.path.splitext(file_path)[1].lower()
-            if file_extension in ['.xlsx', '.xls']:
+            if file_extension in ['.xlsx', '.xls', '.xlsb']:
+                # Determine engine based on file extension
+                if file_extension == '.xlsb':
+                    engine = 'pyxlsb'
+                elif file_extension == '.xls':
+                    engine = None  # pandas will use xlrd or openpyxl automatically
+                else:
+                    engine = 'openpyxl'
+                
                 # Read all sheets from Excel file
-                excel_file = pd.ExcelFile(file_path)
+                try:
+                    excel_file = pd.ExcelFile(file_path, engine=engine)
+                except ImportError as e:
+                    if file_extension == '.xlsb':
+                        logger.error(f"pyxlsb library is required to read .xlsb files. Install it with: pip install pyxlsb")
+                        raise ImportError("pyxlsb library is required to read .xlsb files. Install it with: pip install pyxlsb")
+                    raise
+                
                 sheet_names = excel_file.sheet_names
                 logger.info(f"Found {len(sheet_names)} sheet(s): {sheet_names}")
                 
                 sheets_dict = {}
                 for sheet_name in sheet_names:
                     # Detect the correct header row automatically for each sheet
-                    preview = pd.read_excel(file_path, sheet_name=sheet_name, nrows=10, header=None)
+                    preview = pd.read_excel(file_path, sheet_name=sheet_name, nrows=10, header=None, engine=engine)
                     header_row = None
                     for i, row in preview.iterrows():
                         # Heuristic: a row is header if most cells are strings and not NaN
@@ -242,9 +258,9 @@ class DataEnricher:
                             break
 
                     if header_row is not None:
-                        df_sheet = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
+                        df_sheet = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row, engine=engine)
                     else:
-                        df_sheet = pd.read_excel(file_path, sheet_name=sheet_name)
+                        df_sheet = pd.read_excel(file_path, sheet_name=sheet_name, engine=engine)
                     
                     # Remove unnamed columns (columns that start with "Unnamed:")
                     unnamed_cols = [col for col in df_sheet.columns if str(col).startswith('Unnamed:')]
@@ -333,6 +349,56 @@ class DataEnricher:
         if self.debug_mode:
             logger.info(f"[DEBUG] {message}")
     
+    def split_multi_sector(self, sector: str) -> List[str]:
+        """
+        Split multi-sector route into individual sectors by '/' separator.
+        Examples:
+            'MAA-HYD' -> ['MAA-HYD'] (no '/', returns as single sector)
+            'MAA-HYD/HYD-MAA' -> ['MAA-HYD', 'HYD-MAA'] (split by '/')
+            'MAA-HYD/BLR-DEL/MAA-BOM' -> ['MAA-HYD', 'BLR-DEL', 'MAA-BOM'] (split by '/')
+        If sector has no '/', returns original sector as single-item list.
+        """
+        if self.is_empty_value(sector):
+            return []
+        
+        sector_str = str(sector).strip()
+        
+        # Split by '/' to get individual sectors
+        if '/' in sector_str:
+            sectors = [s.strip() for s in sector_str.split('/') if s.strip()]
+            return sectors
+        else:
+            # No '/' found, return as single sector
+            return [sector_str]
+    
+    def get_first_last_sector(self, sector: str) -> Optional[str]:
+        """
+        Get the first-last airport pattern from a multi-sector route.
+        This ignores all intermediate airports.
+        Examples:
+            'MAA-HYD' -> 'MAA-HYD' (2 airports, no change)
+            'MAA-HYD-BBI' -> 'MAA-BBI' (ignores HYD)
+            'MAA-HYD-BLR-DEL' -> 'MAA-DEL' (ignores HYD, BLR)
+            'MAA-HYD-BLR-DEL-BOM' -> 'MAA-BOM' (ignores HYD, BLR, DEL)
+        Returns None if sector is invalid or has less than 2 airports.
+        """
+        if self.is_empty_value(sector):
+            return None
+        
+        sector_str = str(sector).strip()
+        airports = sector_str.split('-')
+        
+        # Need at least 2 airports
+        if len(airports) < 2:
+            return None
+        
+        # If only 2 airports, return as is
+        if len(airports) == 2:
+            return sector_str
+        
+        # Return first and last airport
+        return f"{airports[0]}-{airports[-1]}"
+    
     def detect_reference_columns(self, df_excel: pd.DataFrame, 
                                 possible_combinations: List[List[str]]) -> List[str]:
         """
@@ -359,6 +425,65 @@ class DataEnricher:
         
         return " AND ".join(conditions)
     
+    def try_match_with_combination(self, row: pd.Series, combination: List[str], 
+                                   excel_to_db_mapping: Dict[str, str], 
+                                   table_name: str, missing_columns: List[str]) -> Optional[Dict]:
+        """
+        Try to match a single row with database using a specific combination.
+        Returns matched data dict if found, None otherwise.
+        """
+        # Get values for this combination
+        key_values = []
+        for ref_col in combination:
+            # Find the Excel column name that maps to this DB column
+            excel_col = None
+            for excel_name, db_name in excel_to_db_mapping.items():
+                if db_name == ref_col:
+                    excel_col = excel_name
+                    break
+            # If not found in mapping, try case-insensitive search (need to get df_excel from context)
+            # Note: This method might not have direct access to df_excel, so we'll use a simpler approach
+            if excel_col is None:
+                # Try to find column in row.index case-insensitively
+                for col in row.index:
+                    if str(col).lower().strip() == str(ref_col).lower().strip():
+                        excel_col = col
+                        break
+            # Last resort: use ref_col as-is
+            if excel_col is None:
+                excel_col = ref_col
+            
+            # Check if column exists and has non-empty value
+            if excel_col not in row.index:
+                return None  # Column not available
+            
+            value = row[excel_col]
+            if self.is_empty_value(value):
+                return None  # Empty value, can't use this combination
+            
+            key_values.append(value)
+        
+        # Build and execute query
+        ref_cols_str = ', '.join([f"`{c}`" for c in combination])
+        missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
+        
+        # Build WHERE clause with AND conditions
+        where_conditions = ' AND '.join([f"`{c}` = %s" for c in combination])
+        
+        query = (
+            f"SELECT {ref_cols_str}, {missing_columns_str} "
+            f"FROM `{table_name}` "
+            f"WHERE {where_conditions} "
+            f"LIMIT 1"
+        )
+        
+        results = self.execute_query_with_retry(query, key_values)
+        
+        if results and len(results) > 0:
+            return {col: results[0].get(col) for col in missing_columns}
+        
+        return None
+    
     def apply_header_formatting(self, original_excel_path: str, output_excel_path: str, 
                                 header_row_index: int = 1) -> bool:
         """
@@ -375,6 +500,12 @@ class DataEnricher:
             bool: True if successful, False otherwise
         """
         try:
+            # Skip formatting for .xlsb files as openpyxl doesn't support them
+            original_ext = os.path.splitext(original_excel_path)[1].lower()
+            if original_ext == '.xlsb':
+                logger.info("Skipping header formatting for .xlsb file (openpyxl doesn't support .xlsb format)")
+                return False
+            
             # Load original file to get header formatting
             original_wb = load_workbook(original_excel_path, read_only=False, data_only=False)
             # Load output file for writing
@@ -579,6 +710,95 @@ class DataEnricher:
                     except Exception:
                         pass
     
+    def format_date_columns(self, output_excel_path: str, header_row_index: int = 1) -> bool:
+        """
+        Format date columns in the output Excel file to display as dd-mm-yyyy.
+        
+        Args:
+            output_excel_path: Path to output Excel file
+            header_row_index: Row index for header (1-based, default 1)
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # List of date column names to format (exact matches and partial matches)
+            date_columns = [
+                'Booking_Date', 'Booking Date', 'booking date',
+                'Travel_Date', 'Travel Date', 'travel date', 'Departure Date', 'departure date',
+                'Invoice_Received_Date', 'Invoice Received Date', 'invoice received date',
+                'Invoice_Date', 'Invoice Date', 'invoice date', 'Date Of Invoice', 'date of invoice',
+                'Original_Invoice_Date', 'Original Invoice Date', 'original invoice date'
+            ]
+            
+            # Also check for columns containing "date" keyword
+            date_keywords = ['date', 'Date', 'DATE']
+            
+            # Load output file
+            output_wb = load_workbook(output_excel_path)
+            
+            # Process each sheet
+            for sheet_name in output_wb.sheetnames:
+                output_ws = output_wb[sheet_name]
+                
+                # Find date columns by header name
+                date_col_indices = []
+                for col_idx in range(1, output_ws.max_column + 1):
+                    cell = output_ws.cell(row=header_row_index, column=col_idx)
+                    if cell.value:
+                        header_name = str(cell.value).strip()
+                        header_lower = header_name.lower()
+                        
+                        # Check if this header matches any date column (case-insensitive)
+                        is_date_column = False
+                        for date_col in date_columns:
+                            if date_col.lower() in header_lower or header_lower in date_col.lower():
+                                is_date_column = True
+                                break
+                        
+                        # Also check if header contains "date" keyword (but not "update", "validate", etc.)
+                        if not is_date_column:
+                            if 'date' in header_lower and not any(word in header_lower for word in ['update', 'validate', 'created', 'modified']):
+                                is_date_column = True
+                        
+                        if is_date_column:
+                            date_col_indices.append(col_idx)
+                            logger.info(f"Found date column: {header_name} at column {col_idx}")
+                
+                # Apply date formatting to all rows in date columns
+                date_format = 'dd-mm-yyyy'
+                for col_idx in date_col_indices:
+                    col_letter = get_column_letter(col_idx)
+                    formatted_count = 0
+                    # Format all data rows (skip header row)
+                    for row_idx in range(header_row_index + 1, output_ws.max_row + 1):
+                        cell = output_ws.cell(row=row_idx, column=col_idx)
+                        # Only format if cell has a value
+                        if cell.value is not None:
+                            # Apply date format to all non-empty cells in date columns
+                            # This will format both Excel date serials and datetime objects
+                            cell.number_format = date_format
+                            formatted_count += 1
+                    
+                    if formatted_count > 0:
+                        logger.info(f"Formatted {formatted_count} date cells in column {col_letter}")
+            
+            # Save the formatted file
+            output_wb.save(output_excel_path)
+            output_wb.close()
+            
+            logger.info(f"Applied date formatting to output file")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Could not apply date formatting: {e}")
+            try:
+                if 'output_wb' in locals():
+                    output_wb.close()
+            except Exception:
+                pass
+            return False
+    
     def _enrich_single_dataframe(self, df_excel: pd.DataFrame, table_name: str,
                                  possible_reference_combinations: List[List[str]],
                                  column_mapping: Dict[str, str]) -> Optional[pd.DataFrame]:
@@ -605,14 +825,18 @@ class DataEnricher:
         if excel_to_db_mapping:
             df_temp = df_temp.rename(columns=excel_to_db_mapping)
         
-        # Dynamically detect reference columns using mapped names
-        reference_columns = self.detect_reference_columns(df_temp, possible_reference_combinations)
+        # Check if at least one combination is available (for validation)
+        available_columns = set(df_temp.columns)
+        valid_combinations = []
+        for combination in possible_reference_combinations:
+            if all(col in available_columns for col in combination):
+                valid_combinations.append(combination)
         
-        if not reference_columns:
+        if not valid_combinations:
             logger.error("No suitable reference columns found")
             return None
         
-        logger.info(f"Using reference columns: {reference_columns}")
+        logger.info(f"Will try matching with {len(valid_combinations)} combinations in cascade order: {valid_combinations}")
         
         # Get database columns
         all_db_columns = self.get_all_columns(table_name)
@@ -620,127 +844,707 @@ class DataEnricher:
             logger.error("Failed to get database columns")
             return None
         
-        # Define specific columns to fetch from database
-        target_columns = [
-            'Taxable_Amount', 'NonTaxable_Amount', 'Cgst_Total', 'Sgst_Total', 'Igst_Total',
-            'Booking_Date', 'GST_Name', 'GST_Number', 'Invoice_Number', 'Invoice_Total_GST',
-            'Airline_Gst_Number', 'Airline_Gst_Name'
+        # Validate that all columns in combinations exist in the database
+        all_db_columns_set = set(all_db_columns)
+        validated_combinations = []
+        for combination in valid_combinations:
+            if all(col in all_db_columns_set for col in combination):
+                validated_combinations.append(combination)
+            else:
+                missing_cols = [col for col in combination if col not in all_db_columns_set]
+                logger.warning(f"Skipping combination {combination} - database columns not found: {missing_cols}")
+        
+        if not validated_combinations:
+            logger.error("No valid combinations found after database column validation")
+            return None
+        
+        # Update valid_combinations to only include validated ones
+        valid_combinations = validated_combinations
+        logger.info(f"After database validation, {len(valid_combinations)} combinations are valid: {valid_combinations}")
+        
+        # Define output column structure: (db_column_name, output_column_name, excel_only)
+        # excel_only=True means only take from Excel if column exists, not from DB
+        output_column_mapping = [
+            (None, 'Legal_Name', True),  # Excel only: "GST Name"
+            (None, 'Company_GST_Number', True),  # Excel only: "GST Number"
+            (None, 'Booking_Date', True),  # Excel only: "Booking Date"
+            (None, 'Travel_Date', True),  # Excel only: "Departure Date"
+            (None, 'Passenger_Name', True),  # Excel only: "LOUIS ARUL AROCKIASAMY" or similar passenger name columns
+            (None, 'PNR', True),  # Excel only: "Airline Pnr"
+            (None, 'Ticket_Number', True),  # Excel only: "Airline Ticket No."
+            (None, 'Vendor Invoice No', True),  # Excel only: "GST INVOICE NO"
+            (None, 'Vendor K3 Amount', True),  # Excel only: "TOTAL K3"
+            (None, 'Airline_Name', True),  # Excel only: "Airline Name"
+            (None, 'Airline_Code', True),  # Excel only: "Airline Code"
+            (None, 'Travel_Mode', True),  # Excel only: "TRIP TYPE"
+            (None, 'Travel_Sector', True),  # Excel only: "Sector"
+            ('Place_Of_Supply', 'Embarking_State', False),  # From DB
+            ('Airline_Gst_Number', 'Airline_GST_Number', False),  # From DB
+            ('Airline_Gst_Name', 'Airline_Legal_Name', False),  # From DB
+            (None, 'Ticket_Amount', True),  # Excel only: "Total Fare (Including GST)"
+            (None, 'Cost_Center', True),  # Excel only: "Cost_Center"
+            ('Invoice_Type', 'Invoice_Type', False),  # From DB
+            ('Email_Date', 'Invoice_Received_Date', False),  # From DB
+            ('Date_Of_Invoice', 'Invoice_Date', False),  # From DB
+            ('Invoice_Number', 'Invoice_Number', False),  # From DB
+            ('Original_Invoice_Number', 'Original_Invoice_Number', False),  # From DB
+            ('Original_Invoice_Date', 'Original_Invoice_Date', False),  # From DB
+            ('Invoice_Total', 'Total_Invoice_Amount', False),  # From DB
+            ('Taxable_Amount', 'Invoice_Taxable_Value', False),  # From DB
+            ('NonTaxable_Amount', 'Invoice_Non_Taxable_Value', False),  # From DB
+            ('Igst_Total', 'Invoice_IGST', False),  # From DB
+            ('Cgst_Total', 'Invoice_CGST', False),  # From DB
+            ('Sgst_Total', 'Invoice_SGST', False),  # From DB
+            ('Invoice_Total_GST', 'Invoice_Total_GST_Amount', False),  # From DB
+            ('Igst_Rate', 'IGST_Rate', False),  # From DB
+            ('Cgst_Rate', 'CGST_Rate', False),  # From DB
+            ('Sgst_Rate', 'SGST_Rate', False),  # From DB
+            ('Public_File_URL', 'Airline_Invoice_Download_Url', False),  # From DB
         ]
         
-        # Column rename mapping: database column name -> display name
-        column_rename_map = {
-            'Booking_Date': 'Booking Date',
-            'GST_Name': 'GST Name',
-            'GST_Number': 'GST Number',
-            'Invoice_Total_GST': 'TOTAL GST',
-            'Cgst_Total': 'CGST',
-            'Sgst_Total': 'SGST',
-            'Igst_Total': 'IGST',
-            'Airline_Gst_Number': 'Airline GST Number',
-            'Airline_Gst_Name': 'Airline GST Name'
+        # Excel column name mappings for Excel-only columns
+        excel_column_mappings = {
+            'Legal_Name': ['GST Name', 'gst name', 'GSTName', 'GST_Name', 'gst_name'],
+            'Company_GST_Number': ['GST Number', 'gst number', 'GSTNumber', 'GST_Number', 'gst_number'],
+            'Booking_Date': ['Booking Date', 'booking date', 'BookingDate', 'Booking_Date', 'booking_date'],
+            'Travel_Date': ['Departure Date', 'departure date', 'DepartureDate', 'Departure_Date', 'departure_date', 'Onward Date', 'onward date', 'OnwardDate', 'Travel_Date', 'travel date'],
+            'Passenger_Name': ['LOUIS ARUL AROCKIASAMY', 'louis arul arokiasamy', 'Traveller', 'Traveler_Name', 'traveler name', 'TravelerName', 'Passenger_Name', 'passenger name', 'Passenger Name'],
+            'PNR': ['Airline Pnr', 'airline pnr', 'Airline PNR', 'Airline PNR/Prov. Booking', 'airline pnr/prov. booking', 'pnrnumber', 'pnr number', 'PNR_Number', 'PNR', 'pnr'],
+            'Ticket_Number': ['Airline Ticket No.', 'airline ticket no.', 'Airline Ticket No', 'Ticket Num/Final Booking', 'ticket num/final booking', 'TicketNumber', 'Ticket Number', 'ticket number', 'Ticket_Number'],
+            'Vendor Invoice No': ['GST INVOICE NO', 'gst invoice no', 'GST Invoice No', 'GST_INVOICE_NO', 'GSTInvoiceNo', 'GST Invoice Number'],
+            'Vendor K3 Amount': ['TOTAL K3', 'total k3', 'Total K3', 'TOTAL_K3', 'TotalK3', 'Total K3 Amount'],
+            'Airline_Name': ['Airline Name', 'airline name', 'AirlineName', 'Airline_Name', 'airline_name'],
+            'Airline_Code': ['Airline Code', 'airline code', 'AirlineCode', 'airlinecode', 'Airline_Code'],
+            'Travel_Mode': ['TRIP TYPE', 'trip type', 'Trip Type', 'TRIP_TYPE', 'TripType', 'Product Type', 'product type', 'ProductType', 'Travel_Mode', 'travel mode'],
+            'Travel_Sector': ['Sector', 'sector', 'Travel_Sector', 'travel sector', 'TravelSector', 'trvael sector', 'travelsector'],
+            'Ticket_Amount': ['Total Fare (Including GST)', 'total fare (including gst)', 'Total Fare', 'total fare', 'TotalFare', 'Total_Fare'],
+            'Cost_Center': ['Cost_Center', 'cost center', 'CostCenter', 'Cost Centre', 'cost centre', 'Cost Center']
         }
         
-        # Find which target columns are missing from Excel data
-        missing_columns = [col for col in target_columns if col not in df_excel.columns]
-        if not missing_columns:
-            logger.info("All target columns already present in Excel data")
-            return df_excel
+        # Extract DB columns to fetch (exclude Excel-only columns)
+        db_columns_to_fetch = [col[0] for col in output_column_mapping if col[0] is not None and not col[2]]
+        # Remove duplicates while preserving order
+        db_columns_to_fetch = list(dict.fromkeys(db_columns_to_fetch))
         
-        logger.info(f"Will fetch {len(missing_columns)} target columns from database: {missing_columns}")
+        # Numeric columns that should be aggregated when multiple sectors are present
+        numeric_columns_to_aggregate = [
+            'Taxable_Amount', 'NonTaxable_Amount', 'Cgst_Total', 'Sgst_Total', 
+            'Igst_Total', 'Invoice_Total_GST', 'Invoice_Total', 'Igst_Rate', 
+            'Cgst_Rate', 'Sgst_Rate'
+        ]
         
-        # Process data in batches
+        # We need to fetch ALL DB columns from database (even if they exist in Excel)
+        # User requirement: "initially fetch from db"
+        missing_columns = db_columns_to_fetch.copy()
+        
+        logger.info(f"Will fetch {len(missing_columns)} columns from database: {missing_columns}")
+        
+        # Find the sector column name in Excel (could be mapped or original)
+        sector_excel_col = None
+        for excel_name, db_name in excel_to_db_mapping.items():
+            if db_name == 'Travel_Sector':
+                sector_excel_col = excel_name
+                break
+        if sector_excel_col is None:
+            # Try to find it directly
+            for col in df_excel.columns:
+                if col.lower().strip() in ['sector', 'travel_sector', 'travel sector']:
+                    sector_excel_col = col
+                    break
+        
+        # Process data in batches with cascading matching logic (optimized for performance)
         enriched_data = []
         match_count = 0
         no_match_count = 0
+        combination_usage_stats = {str(combo): 0 for combo in valid_combinations}
         
+        logger.info(f"Processing {len(df_excel)} rows with cascading matching (batch mode)...")
+        
+        # Process in batches for better performance
         for batch_start in range(0, len(df_excel), BATCH_SIZE):
             batch_end = min(batch_start + BATCH_SIZE, len(df_excel))
             batch_df = df_excel.iloc[batch_start:batch_end]
             
             logger.info(f"Processing batch {batch_start//BATCH_SIZE + 1}: rows {batch_start + 1}-{batch_end}")
             
-            # Build composite keys per row
-            row_keys = {}
-            rows_with_missing_refs = set()
-            for idx, row in batch_df.iterrows():
-                key_values = []
-                valid = True
-                for ref_col in reference_columns:
-                    excel_col = None
-                    for excel_name, db_name in excel_to_db_mapping.items():
-                        if db_name == ref_col:
-                            excel_col = excel_name
-                            break
-                    if excel_col is None:
-                        excel_col = ref_col
-                    value = row[excel_col]
-                    if self.is_empty_value(value):
-                        valid = False
+            # Track which rows have been matched and which combination was used
+            row_matches = {}  # idx -> {matched_data, combination}
+            unmatched_indices = set(batch_df.index)
+            
+            # Try each combination in cascade order, only for unmatched rows
+            for combination in valid_combinations:
+                if not unmatched_indices:
+                    break  # All rows matched, skip remaining combinations
+                
+                # Check if Travel_Sector is in this combination
+                has_sector = 'Travel_Sector' in combination
+                
+                # Build keys for rows that can use this combination
+                row_keys = {}  # idx -> list of tuples (for multi-sector, multiple keys per row)
+                rows_with_valid_keys = []
+                
+                for idx in list(unmatched_indices):
+                    row = batch_df.loc[idx]
+                    key_values_list = []  # List of key tuples (one per sector if multi-sector)
+                    valid = True
+                    
+                    # Get sector value if Travel_Sector is in combination
+                    sector_value = None
+                    if has_sector and sector_excel_col and sector_excel_col in row.index:
+                        sector_value = row[sector_excel_col]
+                    
+                    # Split sector if it's multi-sector
+                    sectors_to_query = []
+                    if has_sector and sector_value and not self.is_empty_value(sector_value):
+                        sectors_to_query = self.split_multi_sector(sector_value)
+                    else:
+                        sectors_to_query = [None]  # Single query without sector splitting
+                    
+                    # Build keys for each sector
+                    for sector in sectors_to_query:
+                        key_values = []
+                        valid_for_sector = True
+                        
+                        for ref_col in combination:
+                            # Find the Excel column name that maps to this DB column
+                            excel_col = None
+                            for excel_name, db_name in excel_to_db_mapping.items():
+                                if db_name == ref_col:
+                                    excel_col = excel_name
+                                    break
+                            # If not found in mapping, try case-insensitive search in original Excel columns
+                            if excel_col is None:
+                                excel_col = self.find_column_case_insensitive(ref_col, list(df_excel.columns))
+                                # If still not found, try to find by checking column_mapping keys
+                                if excel_col is None:
+                                    for mapping_key, db_name in column_mapping.items():
+                                        if db_name == ref_col:
+                                            excel_col = self.find_column_case_insensitive(mapping_key, list(df_excel.columns))
+                                            if excel_col:
+                                                break
+                            # Last resort: use ref_col as-is (might work if column name matches exactly)
+                            if excel_col is None:
+                                excel_col = ref_col
+                            
+                            # Check if column exists and has non-empty value
+                            if excel_col not in row.index:
+                                valid_for_sector = False
+                                break
+                            
+                            value = row[excel_col]
+                            
+                            # If this is Travel_Sector and we have a split sector, use the split sector
+                            if ref_col == 'Travel_Sector' and sector is not None:
+                                value = sector
+                            
+                            if self.is_empty_value(value):
+                                valid_for_sector = False
+                                break
+                            
+                            key_values.append(value)
+                        
+                        if valid_for_sector:
+                            key_values_list.append(tuple(key_values))
+                    
+                    if key_values_list:
+                        row_keys[idx] = key_values_list
+                        rows_with_valid_keys.append(idx)
+                
+                # If we have valid keys, execute batch query
+                if row_keys:
+                    # Collect all unique keys (flatten the list of lists)
+                    all_keys = []
+                    key_to_row_indices = {}  # Map key -> list of row indices that use this key
+                    for idx, keys_list in row_keys.items():
+                        for key in keys_list:
+                            if key not in key_to_row_indices:
+                                all_keys.append(key)
+                                key_to_row_indices[key] = []
+                            key_to_row_indices[key].append(idx)
+                    
+                    unique_keys = list(dict.fromkeys(all_keys))  # Preserve order, remove duplicates
+                    
+                    # Build batch query
+                    ref_cols_str = ', '.join([f"`{c}`" for c in combination])
+                    missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
+                    placeholders = ', '.join(["(" + ", ".join(["%s"] * len(combination)) + ")" for _ in unique_keys])
+                    
+                    # Add NULL checks to ensure we don't match on NULL values in database
+                    null_checks = ' AND '.join([f"`{c}` IS NOT NULL" for c in combination])
+                    
+                    query = (
+                        f"SELECT {ref_cols_str}, {missing_columns_str} "
+                        f"FROM `{table_name}` "
+                        f"WHERE ({ref_cols_str}) IN ({placeholders}) "
+                        f"AND {null_checks}"
+                    )
+                    params = [v for key in unique_keys for v in key]
+                    
+                    # Log query details for Ticket_Number combination
+                    if 'Ticket_Number' in combination:
+                        logger.info(f"Executing query for combination {combination}: {len(unique_keys)} unique keys")
+                        logger.debug(f"Query: {query[:200]}... (truncated)")
+                        logger.debug(f"Sample params (first 3): {params[:min(6, len(params))]}")
+                    
+                    # Execute batch query
+                    results = self.execute_query_with_retry(query, params)
+                    
+                    # Log results for Ticket_Number combination
+                    if 'Ticket_Number' in combination:
+                        logger.info(f"Query returned {len(results)} results for combination {combination}")
+                    
+                    # Build lookup dictionary from results - only store first result per key (LIMIT 1 per combination)
+                    lookup = {}
+                    for r in results:
+                        key = tuple(r[c] for c in combination)
+                        # Only store the first result for each key (ignore duplicates)
+                        if key not in lookup:
+                            lookup[key] = {col: r.get(col) for col in missing_columns}
+                    
+                    # Match rows with results and aggregate for multi-sector
+                    for idx in rows_with_valid_keys:
+                        if idx in unmatched_indices:  # Only process if not already matched
+                            keys_list = row_keys[idx]
+                            aggregated_data = {}
+                            
+                            # Collect all matching results for this row (one per sector/key)
+                            all_results = []
+                            for key in keys_list:
+                                if key in lookup:
+                                    # Each key contributes one result (already limited to 1 per key)
+                                    all_results.append(lookup[key])
+                            
+                            if all_results:
+                                # Aggregate numeric columns across all sectors
+                                for col in missing_columns:
+                                    if col in numeric_columns_to_aggregate:
+                                        # Sum numeric values from all sectors
+                                        total = 0
+                                        for result in all_results:
+                                            val = result.get(col)
+                                            if val is not None:
+                                                try:
+                                                    total += float(val)
+                                                except (ValueError, TypeError):
+                                                    pass
+                                        aggregated_data[col] = total if total != 0 else None
+                                    else:
+                                        # For non-numeric columns, take first non-null value
+                                        for result in all_results:
+                                            val = result.get(col)
+                                            if val is not None:
+                                                aggregated_data[col] = val
+                                                break
+                                        if col not in aggregated_data:
+                                            aggregated_data[col] = None
+                                
+                                row_matches[idx] = {
+                                    'matched_data': aggregated_data,
+                                    'combination': combination
+                                }
+                                unmatched_indices.remove(idx)
+                                combination_usage_stats[str(combination)] += 1
+            
+            # Fallback: Try first-last sector pattern for unmatched rows
+            # This matches patterns like "MAA-HYD-BBI" with "MAA-BBI" in the database
+            if unmatched_indices and sector_excel_col:
+                logger.info(f"Trying first-last sector pattern fallback for {len(unmatched_indices)} unmatched rows")
+                
+                # Find combinations that include Travel_Sector
+                sector_combinations = [combo for combo in valid_combinations if 'Travel_Sector' in combo]
+                
+                for combination in sector_combinations:
+                    if not unmatched_indices:
                         break
-                    key_values.append(value)
-                if valid:
-                    row_keys[idx] = tuple(key_values)
-                else:
-                    rows_with_missing_refs.add(idx)
-
-            unique_keys = list(dict.fromkeys(row_keys.values()))
-
-            if unique_keys:
-                ref_cols_str = ', '.join([f"`{c}`" for c in reference_columns])
-                missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
-                placeholders = ', '.join(["(" + ", ".join(["%s"] * len(reference_columns)) + ")" for _ in unique_keys])
-                query = (
-                    f"SELECT {ref_cols_str}, {missing_columns_str} "
-                    f"FROM `{table_name}` "
-                    f"WHERE ({ref_cols_str}) IN ({placeholders})"
-                )
-                params = [v for key in unique_keys for v in key]
-                results = self.execute_query_with_retry(query, params)
-                lookup = {}
-                for r in results:
-                    key = tuple(r[c] for c in reference_columns)
-                    if key not in lookup:
-                        lookup[key] = {col: r.get(col) for col in missing_columns}
-            else:
-                lookup = {}
-
-            # Emit rows in original order
-            for idx, row in batch_df.iterrows():
-                complete_row = row.to_dict()
-                if idx in rows_with_missing_refs:
-                    for col in missing_columns:
-                        complete_row[col] = None
-                    enriched_data.append(complete_row)
-                    no_match_count += 1
-                    continue
-
-                key = row_keys.get(idx)
-                if key is not None and key in lookup:
-                    for col in missing_columns:
-                        complete_row[col] = lookup[key].get(col)
-                    enriched_data.append(complete_row)
+                    
+                    # Build keys using first-last sector pattern
+                    row_keys_fallback = {}
+                    rows_with_valid_keys_fallback = []
+                    
+                    for idx in list(unmatched_indices):
+                        row = batch_df.loc[idx]
+                        
+                        # Get sector value
+                        if sector_excel_col not in row.index:
+                            continue
+                        
+                        sector_value = row[sector_excel_col]
+                        if self.is_empty_value(sector_value):
+                            continue
+                        
+                        # Get first-last sector pattern
+                        first_last_sector = self.get_first_last_sector(sector_value)
+                        if not first_last_sector or first_last_sector == sector_value:
+                            # No intermediate airports to skip, skip this fallback
+                            continue
+                        
+                        # Build key with first-last sector
+                        key_values = []
+                        valid_for_sector = True
+                        
+                        for ref_col in combination:
+                            # Find the Excel column name that maps to this DB column
+                            excel_col = None
+                            for excel_name, db_name in excel_to_db_mapping.items():
+                                if db_name == ref_col:
+                                    excel_col = excel_name
+                                    break
+                            # If not found in mapping, try case-insensitive search in original Excel columns
+                            if excel_col is None:
+                                excel_col = self.find_column_case_insensitive(ref_col, list(df_excel.columns))
+                                # If still not found, try to find by checking column_mapping keys
+                                if excel_col is None:
+                                    for mapping_key, db_name in column_mapping.items():
+                                        if db_name == ref_col:
+                                            excel_col = self.find_column_case_insensitive(mapping_key, list(df_excel.columns))
+                                            if excel_col:
+                                                break
+                            # Last resort: use ref_col as-is (might work if column name matches exactly)
+                            if excel_col is None:
+                                excel_col = ref_col
+                            
+                            # Check if column exists and has non-empty value
+                            if excel_col not in row.index:
+                                valid_for_sector = False
+                                break
+                            
+                            value = row[excel_col]
+                            
+                            # Use first-last sector pattern for Travel_Sector
+                            if ref_col == 'Travel_Sector':
+                                value = first_last_sector
+                            
+                            if self.is_empty_value(value):
+                                valid_for_sector = False
+                                break
+                            
+                            key_values.append(value)
+                        
+                        if valid_for_sector:
+                            row_keys_fallback[idx] = [tuple(key_values)]
+                            rows_with_valid_keys_fallback.append(idx)
+                    
+                    # If we have valid keys, execute batch query
+                    if row_keys_fallback:
+                        # Collect all unique keys
+                        all_keys_fallback = []
+                        key_to_row_indices_fallback = {}
+                        for idx, keys_list in row_keys_fallback.items():
+                            for key in keys_list:
+                                if key not in key_to_row_indices_fallback:
+                                    all_keys_fallback.append(key)
+                                    key_to_row_indices_fallback[key] = []
+                                key_to_row_indices_fallback[key].append(idx)
+                        
+                        unique_keys_fallback = list(dict.fromkeys(all_keys_fallback))
+                        
+                        # Build batch query
+                        ref_cols_str = ', '.join([f"`{c}`" for c in combination])
+                        missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
+                        placeholders = ', '.join(["(" + ", ".join(["%s"] * len(combination)) + ")" for _ in unique_keys_fallback])
+                        
+                        # Add NULL checks
+                        null_checks = ' AND '.join([f"`{c}` IS NOT NULL" for c in combination])
+                        
+                        query = (
+                            f"SELECT {ref_cols_str}, {missing_columns_str} "
+                            f"FROM `{table_name}` "
+                            f"WHERE ({ref_cols_str}) IN ({placeholders}) "
+                            f"AND {null_checks}"
+                        )
+                        params = [v for key in unique_keys_fallback for v in key]
+                        
+                        # Execute batch query
+                        results_fallback = self.execute_query_with_retry(query, params)
+                        
+                        # Build lookup dictionary from results
+                        lookup_fallback = {}
+                        for r in results_fallback:
+                            key = tuple(r[c] for c in combination)
+                            if key not in lookup_fallback:
+                                lookup_fallback[key] = {col: r.get(col) for col in missing_columns}
+                        
+                        # Match rows with results
+                        for idx in rows_with_valid_keys_fallback:
+                            if idx in unmatched_indices:
+                                keys_list = row_keys_fallback[idx]
+                                
+                                # Collect matching results
+                                all_results_fallback = []
+                                for key in keys_list:
+                                    if key in lookup_fallback:
+                                        all_results_fallback.append(lookup_fallback[key])
+                                
+                                if all_results_fallback:
+                                    # Aggregate numeric columns
+                                    aggregated_data_fallback = {}
+                                    for col in missing_columns:
+                                        if col in numeric_columns_to_aggregate:
+                                            total = 0
+                                            for result in all_results_fallback:
+                                                val = result.get(col)
+                                                if val is not None:
+                                                    try:
+                                                        total += float(val)
+                                                    except (ValueError, TypeError):
+                                                        pass
+                                            aggregated_data_fallback[col] = total if total != 0 else None
+                                        else:
+                                            # For non-numeric columns, take first non-null value
+                                            for result in all_results_fallback:
+                                                val = result.get(col)
+                                                if val is not None:
+                                                    aggregated_data_fallback[col] = val
+                                                    break
+                                            if col not in aggregated_data_fallback:
+                                                aggregated_data_fallback[col] = None
+                                    
+                                    row_matches[idx] = {
+                                        'matched_data': aggregated_data_fallback,
+                                        'combination': combination
+                                    }
+                                    unmatched_indices.remove(idx)
+                                    combination_usage_stats[f"{str(combination)} (first-last fallback)"] = combination_usage_stats.get(f"{str(combination)} (first-last fallback)", 0) + 1
+                                    logger.debug(f"Matched row {idx} using first-last sector pattern: {first_last_sector}")
+            
+            # Fallback: Try Ticket_Number value as PNR_Number (since Ticket_Number column sometimes contains PNR numbers)
+            # This handles cases where Ticket_Number column has PNR values instead of ticket numbers
+            if unmatched_indices and sector_excel_col:
+                logger.info(f"Trying Ticket_Number as PNR_Number fallback for {len(unmatched_indices)} unmatched rows")
+                
+                # Find Ticket_Number column in Excel
+                ticket_excel_col = None
+                for excel_name, db_name in excel_to_db_mapping.items():
+                    if db_name == 'Ticket_Number':
+                        ticket_excel_col = excel_name
+                        break
+                if ticket_excel_col is None:
+                    # Try to find it directly
+                    for col in df_excel.columns:
+                        if col.lower().strip() in ['ticket number', 'ticketnumber', 'ticket_num', 'airline ticket no.', 'ticket num/final booking']:
+                            ticket_excel_col = col
+                            break
+                
+                # Find PNR_Number column in Excel (for reference, but we'll use Ticket_Number value)
+                pnr_excel_col = None
+                for excel_name, db_name in excel_to_db_mapping.items():
+                    if db_name == 'PNR_Number':
+                        pnr_excel_col = excel_name
+                        break
+                if pnr_excel_col is None:
+                    for col in df_excel.columns:
+                        if col.lower().strip() in ['pnr', 'pnr number', 'pnrnumber', 'airline pnr', 'airline pnr/prov. booking']:
+                            pnr_excel_col = col
+                            break
+                
+                # Only proceed if we have both Ticket_Number and Travel_Sector columns
+                if ticket_excel_col and sector_excel_col:
+                    # Build keys using Ticket_Number value as PNR_Number
+                    row_keys_ticket_as_pnr = {}
+                    rows_with_valid_keys_ticket_as_pnr = []
+                    
+                    for idx in list(unmatched_indices):
+                        row = batch_df.loc[idx]
+                        
+                        # Get Ticket_Number value
+                        if ticket_excel_col not in row.index:
+                            continue
+                        
+                        ticket_value = row[ticket_excel_col]
+                        if self.is_empty_value(ticket_value):
+                            continue
+                        
+                        # Get sector value
+                        if sector_excel_col not in row.index:
+                            continue
+                        
+                        sector_value = row[sector_excel_col]
+                        if self.is_empty_value(sector_value):
+                            continue
+                        
+                        # Split sector if it's multi-sector
+                        sectors_to_query_ticket = self.split_multi_sector(sector_value)
+                        
+                        # Build keys for each sector using Ticket_Number as PNR_Number
+                        key_values_list_ticket = []
+                        for sector in sectors_to_query_ticket:
+                            key_values_ticket = [ticket_value, sector]  # [PNR_Number, Travel_Sector]
+                            key_values_list_ticket.append(tuple(key_values_ticket))
+                        
+                        if key_values_list_ticket:
+                            row_keys_ticket_as_pnr[idx] = key_values_list_ticket
+                            rows_with_valid_keys_ticket_as_pnr.append(idx)
+                    
+                    # If we have valid keys, execute batch query using PNR_Number + Travel_Sector
+                    if row_keys_ticket_as_pnr:
+                        # Collect all unique keys
+                        all_keys_ticket_as_pnr = []
+                        key_to_row_indices_ticket_as_pnr = {}
+                        for idx, keys_list in row_keys_ticket_as_pnr.items():
+                            for key in keys_list:
+                                if key not in key_to_row_indices_ticket_as_pnr:
+                                    all_keys_ticket_as_pnr.append(key)
+                                    key_to_row_indices_ticket_as_pnr[key] = []
+                                key_to_row_indices_ticket_as_pnr[key].append(idx)
+                        
+                        unique_keys_ticket_as_pnr = list(dict.fromkeys(all_keys_ticket_as_pnr))
+                        
+                        # Build batch query using PNR_Number and Travel_Sector
+                        pnr_sector_combination = ['PNR_Number', 'Travel_Sector']
+                        ref_cols_str_ticket = ', '.join([f"`{c}`" for c in pnr_sector_combination])
+                        missing_columns_str_ticket = ', '.join([f"`{col}`" for col in missing_columns])
+                        placeholders_ticket = ', '.join(["(" + ", ".join(["%s"] * len(pnr_sector_combination)) + ")" for _ in unique_keys_ticket_as_pnr])
+                        
+                        # Add NULL checks
+                        null_checks_ticket = ' AND '.join([f"`{c}` IS NOT NULL" for c in pnr_sector_combination])
+                        
+                        query_ticket = (
+                            f"SELECT {ref_cols_str_ticket}, {missing_columns_str_ticket} "
+                            f"FROM `{table_name}` "
+                            f"WHERE ({ref_cols_str_ticket}) IN ({placeholders_ticket}) "
+                            f"AND {null_checks_ticket}"
+                        )
+                        params_ticket = [v for key in unique_keys_ticket_as_pnr for v in key]
+                        
+                        # Execute batch query
+                        results_ticket_as_pnr = self.execute_query_with_retry(query_ticket, params_ticket)
+                        
+                        # Build lookup dictionary from results
+                        lookup_ticket_as_pnr = {}
+                        for r in results_ticket_as_pnr:
+                            key = tuple(r[c] for c in pnr_sector_combination)
+                            if key not in lookup_ticket_as_pnr:
+                                lookup_ticket_as_pnr[key] = {col: r.get(col) for col in missing_columns}
+                        
+                        # Match rows with results
+                        for idx in rows_with_valid_keys_ticket_as_pnr:
+                            if idx in unmatched_indices:
+                                keys_list = row_keys_ticket_as_pnr[idx]
+                                
+                                # Collect matching results
+                                all_results_ticket = []
+                                for key in keys_list:
+                                    if key in lookup_ticket_as_pnr:
+                                        all_results_ticket.append(lookup_ticket_as_pnr[key])
+                                
+                                if all_results_ticket:
+                                    # Aggregate numeric columns
+                                    aggregated_data_ticket = {}
+                                    for col in missing_columns:
+                                        if col in numeric_columns_to_aggregate:
+                                            total = 0
+                                            for result in all_results_ticket:
+                                                val = result.get(col)
+                                                if val is not None:
+                                                    try:
+                                                        total += float(val)
+                                                    except (ValueError, TypeError):
+                                                        pass
+                                            aggregated_data_ticket[col] = total if total != 0 else None
+                                        else:
+                                            # For non-numeric columns, take first non-null value
+                                            for result in all_results_ticket:
+                                                val = result.get(col)
+                                                if val is not None:
+                                                    aggregated_data_ticket[col] = val
+                                                    break
+                                            if col not in aggregated_data_ticket:
+                                                aggregated_data_ticket[col] = None
+                                    
+                                    row_matches[idx] = {
+                                        'matched_data': aggregated_data_ticket,
+                                        'combination': ['PNR_Number', 'Travel_Sector']  # Mark as PNR_Number match
+                                    }
+                                    unmatched_indices.remove(idx)
+                                    combination_usage_stats["Ticket_Number_as_PNR_Number (fallback)"] = combination_usage_stats.get("Ticket_Number_as_PNR_Number (fallback)", 0) + 1
+                                    logger.debug(f"Matched row {idx} using Ticket_Number value as PNR_Number: {ticket_value}")
+            
+            # Build enriched rows in original order (preserve exact row sequence)
+            # Iterate by position to ensure order is maintained
+            for pos in range(len(batch_df)):
+                idx = batch_df.index[pos]
+                row_data = batch_df.iloc[pos].to_dict()
+                
+                # Create a new row dict with all required columns
+                complete_row = {}
+                
+                # Get matched data from database (if row was matched)
+                matched_db_data = {}
+                if idx in row_matches:
+                    match_info = row_matches[idx]
+                    matched_db_data = match_info['matched_data']
                     match_count += 1
                 else:
-                    for col in missing_columns:
-                        complete_row[col] = None
-                    enriched_data.append(complete_row)
                     no_match_count += 1
+                
+                # Process each column according to output_column_mapping
+                for db_col, output_col, excel_only in output_column_mapping:
+                    if excel_only:
+                        # Excel-only columns: only take from Excel if column exists
+                        excel_col_found = None
+                        excel_names = excel_column_mappings.get(output_col, [])
+                        for excel_name in excel_names:
+                            matched_col = self.find_column_case_insensitive(excel_name, list(df_excel.columns))
+                            if matched_col:
+                                excel_col_found = matched_col
+                                break
+                        
+                        if excel_col_found and excel_col_found in row_data:
+                            # For Excel-only columns, use output_col as the key directly
+                            complete_row[output_col] = row_data[excel_col_found]
+                        else:
+                            complete_row[output_col] = None
+                    else:
+                        # DB columns: always fetch from DB (even if exists in Excel)
+                        # Use matched data from database
+                        complete_row[db_col] = matched_db_data.get(db_col)
+                
+                enriched_data.append(complete_row)
+        
+        # Log combination usage statistics
+        logger.info("Combination usage statistics:")
+        for combo_str, count in combination_usage_stats.items():
+            logger.info(f"  {combo_str}: {count} matches")
         
         # Create final DataFrame
         df_enriched = pd.DataFrame(enriched_data)
         
+        # Build column rename mapping: internal column name -> output column name
+        rename_dict = {}
+        for db_col, output_col, excel_only in output_column_mapping:
+            if excel_only:
+                # Excel-only columns: output_col is already the key
+                if output_col in df_enriched.columns:
+                    rename_dict[output_col] = output_col  # Already correct name
+            else:
+                # DB columns: db_col -> output_col
+                if db_col in df_enriched.columns:
+                    rename_dict[db_col] = output_col
+        
         # Apply column rename mapping
-        rename_dict = {db_col: display_name for db_col, display_name in column_rename_map.items() 
-                      if db_col in df_enriched.columns}
         if rename_dict:
             df_enriched = df_enriched.rename(columns=rename_dict)
         
-        # Build final column order
-        missing_columns_display = [rename_dict.get(col, col) for col in missing_columns]
-        final_column_order = list(df_excel.columns) + missing_columns_display
+        # Build final column order based on output_column_mapping
+        final_column_order = []
+        for db_col, output_col, excel_only in output_column_mapping:
+            if output_col in df_enriched.columns:
+                final_column_order.append(output_col)
+        
+        # Only include columns that exist in the DataFrame
+        final_column_order = [col for col in final_column_order if col in df_enriched.columns]
+        
+        # Add any remaining columns that weren't in the mapping (shouldn't happen, but safety check)
+        remaining_cols = [col for col in df_enriched.columns if col not in final_column_order]
+        if remaining_cols:
+            logger.warning(f"Found unexpected columns: {remaining_cols}")
+            final_column_order.extend(remaining_cols)
+        
+        # Reorder DataFrame to match exact order
         df_enriched = df_enriched[final_column_order]
         
         logger.info(f"Sheet processing complete: {len(df_enriched)} rows, {match_count} matches, {no_match_count} no matches")
+        logger.info(f"Output columns ({len(final_column_order)}): {final_column_order}")
         
         return df_enriched
 
@@ -787,6 +1591,20 @@ class DataEnricher:
                         df_combined = pd.concat(list(enriched_sheets.values()), ignore_index=True)
                         df_combined.to_csv(output_path, index=False)
                         logger.info(f"Data saved to: {output_path}")
+                        
+                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        try:
+                            logger.info("Splitting data into credit_note and Invoice files...")
+                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                                output_path,
+                                output_directory=os.path.dirname(output_path)
+                            )
+                            if credit_note_path:
+                                logger.info(f"Credit note file created: {credit_note_path}")
+                            if invoice_path:
+                                logger.info(f"Invoice file created: {invoice_path}")
+                        except Exception as split_error:
+                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
                     else:
                         # Save each sheet separately in Excel
                         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -799,6 +1617,26 @@ class DataEnricher:
                             self.apply_header_formatting(excel_path, output_path)
                         except Exception as format_error:
                             logger.warning(f"Could not apply header formatting: {format_error}")
+                        
+                        # Apply date formatting
+                        try:
+                            self.format_date_columns(output_path)
+                        except Exception as date_format_error:
+                            logger.warning(f"Could not apply date formatting: {date_format_error}")
+                        
+                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        try:
+                            logger.info("Splitting data into credit_note and Invoice files...")
+                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                                output_path,
+                                output_directory=os.path.dirname(output_path)
+                            )
+                            if credit_note_path:
+                                logger.info(f"Credit note file created: {credit_note_path}")
+                            if invoice_path:
+                                logger.info(f"Invoice file created: {invoice_path}")
+                        except Exception as split_error:
+                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
                 except Exception as e:
                     logger.error(f"Error saving file: {e}")
             
@@ -817,6 +1655,20 @@ class DataEnricher:
                     if output_extension == '.csv':
                         df_enriched.to_csv(output_path, index=False)
                         logger.info(f"Data saved to: {output_path}")
+                        
+                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        try:
+                            logger.info("Splitting data into credit_note and Invoice files...")
+                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                                output_path,
+                                output_directory=os.path.dirname(output_path)
+                            )
+                            if credit_note_path:
+                                logger.info(f"Credit note file created: {credit_note_path}")
+                            if invoice_path:
+                                logger.info(f"Invoice file created: {invoice_path}")
+                        except Exception as split_error:
+                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
                     else:
                         df_enriched.to_excel(output_path, index=False, engine='openpyxl')
                         logger.info(f"Data saved to: {output_path}")
@@ -825,6 +1677,26 @@ class DataEnricher:
                             self.apply_header_formatting(excel_path, output_path)
                         except Exception as format_error:
                             logger.warning(f"Could not apply header formatting: {format_error}")
+                        
+                        # Apply date formatting
+                        try:
+                            self.format_date_columns(output_path)
+                        except Exception as date_format_error:
+                            logger.warning(f"Could not apply date formatting: {date_format_error}")
+                        
+                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        try:
+                            logger.info("Splitting data into credit_note and Invoice files...")
+                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                                output_path,
+                                output_directory=os.path.dirname(output_path)
+                            )
+                            if credit_note_path:
+                                logger.info(f"Credit note file created: {credit_note_path}")
+                            if invoice_path:
+                                logger.info(f"Invoice file created: {invoice_path}")
+                        except Exception as split_error:
+                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
                 except Exception as e:
                     logger.error(f"Error saving file: {e}")
             
@@ -931,7 +1803,7 @@ class EmailSender:
                             
                             # Determine MIME type based on file extension
                             file_ext = os.path.splitext(file_path)[1].lower()
-                            if file_ext in ['.xlsx', '.xls']:
+                            if file_ext in ['.xlsx', '.xls', '.xlsb']:
                                 mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                             elif file_ext == '.csv':
                                 mime_type = 'text/csv'

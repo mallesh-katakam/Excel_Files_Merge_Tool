@@ -1,7 +1,7 @@
 {
-    "input_directory": "C:\\Users\\sharm\\Downloads\\sftp_files",
-    "output_directory": "C:\\Users\\sharm\\Downloads\\sftp_files\\processed",
-    "supported_extensions": [".xlsx", ".xls", ".csv"],
+    "input_directory": "D:\\Gst_Files",
+    "output_directory": "D:\\Gst_Files\\processed",
+    "supported_extensions": [".xlsx", ".xls", ".xlsb", ".csv"],
     "database": {
         "host": "183.82.97.170",
         "database": "ats",
@@ -20,10 +20,18 @@
         "Sector": "Travel_Sector",
         "trvael sector": "Travel_Sector",
         "travelsector": "Travel_Sector",
-        "travel sector": "Travel_Sector"
+        "travel sector": "Travel_Sector",
+        "Ticket Num/Final Booking": "Ticket_Number",
+        "Ticket Number": "Ticket_Number",
+        "Airline Ticket No.": "Ticket_Number",
+        "airline ticket no.": "Ticket_Number",
+        "ticketnumber": "Ticket_Number",
+        "ticket number": "Ticket_Number"
     },
     "possible_reference_combinations": [
-        ["PNR_Number", "Airline_Code", "Travel_Sector"]
+        ["PNR_Number", "Airline_Code", "Travel_Sector"],
+        ["PNR_Number", "Travel_Sector"],
+        ["Ticket_Number", "Travel_Sector"]
     ],
     "processing": {
         "batch_size": 100,
