@@ -22,6 +22,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from data_splitter import split_by_vendor_k3_amount
+from invoice_deduplicator import process_multiple_files
 
 # Configure enhanced logging for automated execution
 log_file = f"data_merge_{datetime.now().strftime('%Y%m%d')}.log"
@@ -98,6 +99,9 @@ class FileProcessor:
                 pattern = os.path.join(self.input_directory, f"*{ext}")
                 found_files = glob.glob(pattern)
                 files.extend(found_files)
+            
+            # Filter out temporary Excel lock files (files starting with ~$)
+            files = [f for f in files if not os.path.basename(f).startswith('~$')]
             
             logger.info(f"Found {len(files)} files to process in {self.input_directory}")
             return files
@@ -879,7 +883,7 @@ class DataEnricher:
             (None, 'Travel_Mode', True),  # Excel only: "TRIP TYPE"
             (None, 'Travel_Sector', True),  # Excel only: "Sector"
             ('Place_Of_Supply', 'Embarking_State', False),  # From DB
-            ('Airline_Gst_Number', 'Airline_GST_Number', False),  # From DB
+            ('GST_Number', 'Airline_GST_Number', False),  # From DB
             ('Airline_Gst_Name', 'Airline_Legal_Name', False),  # From DB
             (None, 'Ticket_Amount', True),  # Excel only: "Total Fare (Including GST)"
             (None, 'Cost_Center', True),  # Excel only: "Cost_Center"
@@ -952,6 +956,21 @@ class DataEnricher:
                     sector_excel_col = col
                     break
         
+        # Find the Vendor Invoice No column name in Excel
+        vendor_invoice_col = None
+        for excel_name, db_name in excel_to_db_mapping.items():
+            if db_name == 'Vendor Invoice No':
+                vendor_invoice_col = excel_name
+                break
+        if vendor_invoice_col is None:
+            # Try to find it using the mapping
+            possible_names = excel_column_mappings.get('Vendor Invoice No', [])
+            for name in possible_names:
+                matched_col = self.find_column_case_insensitive(name, list(df_excel.columns))
+                if matched_col:
+                    vendor_invoice_col = matched_col
+                    break
+        
         # Process data in batches with cascading matching logic (optimized for performance)
         enriched_data = []
         match_count = 0
@@ -993,12 +1012,12 @@ class DataEnricher:
                     if has_sector and sector_excel_col and sector_excel_col in row.index:
                         sector_value = row[sector_excel_col]
                     
-                    # Split sector if it's multi-sector
+                    # Use sector directly from Excel file (no splitting)
                     sectors_to_query = []
                     if has_sector and sector_value and not self.is_empty_value(sector_value):
-                        sectors_to_query = self.split_multi_sector(sector_value)
+                        sectors_to_query = [sector_value]  # Use sector directly without splitting
                     else:
-                        sectors_to_query = [None]  # Single query without sector splitting
+                        sectors_to_query = [None]  # Single query without sector
                     
                     # Build keys for each sector
                     for sector in sectors_to_query:
@@ -1033,7 +1052,7 @@ class DataEnricher:
                             
                             value = row[excel_col]
                             
-                            # If this is Travel_Sector and we have a split sector, use the split sector
+                            # If this is Travel_Sector, use the sector value directly from Excel
                             if ref_col == 'Travel_Sector' and sector is not None:
                                 value = sector
                             
@@ -1055,16 +1074,33 @@ class DataEnricher:
                     # Collect all unique keys (flatten the list of lists)
                     all_keys = []
                     key_to_row_indices = {}  # Map key -> list of row indices that use this key
+                    key_to_pattern = {}  # Map key -> 'CN' or 'IN' pattern based on GST INVOICE NO
+                    
                     for idx, keys_list in row_keys.items():
+                        # Get GST INVOICE NO pattern for this row
+                        invoice_pattern = None
+                        if vendor_invoice_col and vendor_invoice_col in batch_df.loc[idx].index:
+                            vendor_invoice_val = batch_df.loc[idx, vendor_invoice_col]
+                            if not self.is_empty_value(vendor_invoice_val):
+                                vendor_invoice_str = str(vendor_invoice_val).strip().upper()
+                                if vendor_invoice_str.startswith('CN'):
+                                    invoice_pattern = 'CN'
+                                elif vendor_invoice_str.startswith('IN'):
+                                    invoice_pattern = 'IN'
+                        
                         for key in keys_list:
                             if key not in key_to_row_indices:
                                 all_keys.append(key)
                                 key_to_row_indices[key] = []
+                                key_to_pattern[key] = None
                             key_to_row_indices[key].append(idx)
+                            # Set pattern for key (if multiple rows use same key, use first non-None pattern)
+                            if invoice_pattern and key_to_pattern[key] is None:
+                                key_to_pattern[key] = invoice_pattern
                     
                     unique_keys = list(dict.fromkeys(all_keys))  # Preserve order, remove duplicates
                     
-                    # Build batch query
+                    # Build batch query with ORDER BY for Original_Invoice_Number prioritization
                     ref_cols_str = ', '.join([f"`{c}`" for c in combination])
                     missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
                     placeholders = ', '.join(["(" + ", ".join(["%s"] * len(combination)) + ")" for _ in unique_keys])
@@ -1072,11 +1108,18 @@ class DataEnricher:
                     # Add NULL checks to ensure we don't match on NULL values in database
                     null_checks = ' AND '.join([f"`{c}` IS NOT NULL" for c in combination])
                     
+                    # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
+                    # For CN: prioritize NOT NULL, for IN: prioritize NULL
+                    # Since we have mixed patterns, we'll use a general ordering and handle prioritization in code
+                    # But we can still add ORDER BY to help with the prioritization
+                    order_by_clause = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                    
                     query = (
                         f"SELECT {ref_cols_str}, {missing_columns_str} "
                         f"FROM `{table_name}` "
                         f"WHERE ({ref_cols_str}) IN ({placeholders}) "
-                        f"AND {null_checks}"
+                        f"AND {null_checks} "
+                        f"{order_by_clause}"
                     )
                     params = [v for key in unique_keys for v in key]
                     
@@ -1093,13 +1136,54 @@ class DataEnricher:
                     if 'Ticket_Number' in combination:
                         logger.info(f"Query returned {len(results)} results for combination {combination}")
                     
-                    # Build lookup dictionary from results - only store first result per key (LIMIT 1 per combination)
-                    lookup = {}
+                    # Group results by key first (multiple results per key possible)
+                    results_by_key = {}
                     for r in results:
                         key = tuple(r[c] for c in combination)
-                        # Only store the first result for each key (ignore duplicates)
-                        if key not in lookup:
-                            lookup[key] = {col: r.get(col) for col in missing_columns}
+                        if key not in results_by_key:
+                            results_by_key[key] = []
+                        results_by_key[key].append({col: r.get(col) for col in missing_columns})
+                    
+                    # Build lookup dictionary from grouped results
+                    # Prioritize based on GST INVOICE NO pattern and Original_Invoice_Number
+                    lookup = {}
+                    for key in results_by_key:
+                        key_results = results_by_key[key]
+                        pattern = key_to_pattern.get(key)
+                        
+                        if pattern == 'CN':
+                            # For CN: prioritize records with Original_Invoice_Number NOT NULL
+                            # If no such record, use Original_Invoice_Number NULL
+                            prioritized_result = None
+                            fallback_result = None
+                            
+                            for result in key_results:
+                                original_inv_num = result.get('Original_Invoice_Number')
+                                if not self.is_empty_value(original_inv_num):
+                                    prioritized_result = result
+                                    break
+                                elif fallback_result is None:
+                                    fallback_result = result
+                            
+                            lookup[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                        elif pattern == 'IN':
+                            # For IN: prioritize records with Original_Invoice_Number NULL
+                            # If no such record, use Original_Invoice_Number NOT NULL
+                            prioritized_result = None
+                            fallback_result = None
+                            
+                            for result in key_results:
+                                original_inv_num = result.get('Original_Invoice_Number')
+                                if self.is_empty_value(original_inv_num):
+                                    prioritized_result = result
+                                    break
+                                elif fallback_result is None:
+                                    fallback_result = result
+                            
+                            lookup[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                        else:
+                            # No pattern or unknown pattern: use first result
+                            lookup[key] = key_results[0]
                     
                     # Match rows with results and aggregate for multi-sector
                     for idx in rows_with_valid_keys:
@@ -1229,16 +1313,33 @@ class DataEnricher:
                         # Collect all unique keys
                         all_keys_fallback = []
                         key_to_row_indices_fallback = {}
+                        key_to_pattern_fallback = {}  # Map key -> 'CN' or 'IN' pattern based on GST INVOICE NO
+                        
                         for idx, keys_list in row_keys_fallback.items():
+                            # Get GST INVOICE NO pattern for this row
+                            invoice_pattern = None
+                            if vendor_invoice_col and vendor_invoice_col in batch_df.loc[idx].index:
+                                vendor_invoice_val = batch_df.loc[idx, vendor_invoice_col]
+                                if not self.is_empty_value(vendor_invoice_val):
+                                    vendor_invoice_str = str(vendor_invoice_val).strip().upper()
+                                    if vendor_invoice_str.startswith('CN'):
+                                        invoice_pattern = 'CN'
+                                    elif vendor_invoice_str.startswith('IN'):
+                                        invoice_pattern = 'IN'
+                            
                             for key in keys_list:
                                 if key not in key_to_row_indices_fallback:
                                     all_keys_fallback.append(key)
                                     key_to_row_indices_fallback[key] = []
+                                    key_to_pattern_fallback[key] = None
                                 key_to_row_indices_fallback[key].append(idx)
+                                # Set pattern for key (if multiple rows use same key, use first non-None pattern)
+                                if invoice_pattern and key_to_pattern_fallback[key] is None:
+                                    key_to_pattern_fallback[key] = invoice_pattern
                         
                         unique_keys_fallback = list(dict.fromkeys(all_keys_fallback))
                         
-                        # Build batch query
+                        # Build batch query with ORDER BY for Original_Invoice_Number prioritization
                         ref_cols_str = ', '.join([f"`{c}`" for c in combination])
                         missing_columns_str = ', '.join([f"`{col}`" for col in missing_columns])
                         placeholders = ', '.join(["(" + ", ".join(["%s"] * len(combination)) + ")" for _ in unique_keys_fallback])
@@ -1246,23 +1347,69 @@ class DataEnricher:
                         # Add NULL checks
                         null_checks = ' AND '.join([f"`{c}` IS NOT NULL" for c in combination])
                         
+                        # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
+                        order_by_clause = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        
                         query = (
                             f"SELECT {ref_cols_str}, {missing_columns_str} "
                             f"FROM `{table_name}` "
                             f"WHERE ({ref_cols_str}) IN ({placeholders}) "
-                            f"AND {null_checks}"
+                            f"AND {null_checks} "
+                            f"{order_by_clause}"
                         )
                         params = [v for key in unique_keys_fallback for v in key]
                         
                         # Execute batch query
                         results_fallback = self.execute_query_with_retry(query, params)
                         
-                        # Build lookup dictionary from results
-                        lookup_fallback = {}
+                        # Group results by key first (multiple results per key possible)
+                        results_by_key_fallback = {}
                         for r in results_fallback:
                             key = tuple(r[c] for c in combination)
-                            if key not in lookup_fallback:
-                                lookup_fallback[key] = {col: r.get(col) for col in missing_columns}
+                            if key not in results_by_key_fallback:
+                                results_by_key_fallback[key] = []
+                            results_by_key_fallback[key].append({col: r.get(col) for col in missing_columns})
+                        
+                        # Build lookup dictionary from grouped results
+                        # Prioritize based on GST INVOICE NO pattern and Original_Invoice_Number
+                        lookup_fallback = {}
+                        for key in results_by_key_fallback:
+                            key_results = results_by_key_fallback[key]
+                            pattern = key_to_pattern_fallback.get(key)
+                            
+                            if pattern == 'CN':
+                                # For CN: prioritize records with Original_Invoice_Number NOT NULL
+                                # If no such record, use Original_Invoice_Number NULL
+                                prioritized_result = None
+                                fallback_result = None
+                                
+                                for result in key_results:
+                                    original_inv_num = result.get('Original_Invoice_Number')
+                                    if not self.is_empty_value(original_inv_num):
+                                        prioritized_result = result
+                                        break
+                                    elif fallback_result is None:
+                                        fallback_result = result
+                                
+                                lookup_fallback[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                            elif pattern == 'IN':
+                                # For IN: prioritize records with Original_Invoice_Number NULL
+                                # If no such record, use Original_Invoice_Number NOT NULL
+                                prioritized_result = None
+                                fallback_result = None
+                                
+                                for result in key_results:
+                                    original_inv_num = result.get('Original_Invoice_Number')
+                                    if self.is_empty_value(original_inv_num):
+                                        prioritized_result = result
+                                        break
+                                    elif fallback_result is None:
+                                        fallback_result = result
+                                
+                                lookup_fallback[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                            else:
+                                # No pattern or unknown pattern: use first result
+                                lookup_fallback[key] = key_results[0]
                         
                         # Match rows with results
                         for idx in rows_with_valid_keys_fallback:
@@ -1362,8 +1509,8 @@ class DataEnricher:
                         if self.is_empty_value(sector_value):
                             continue
                         
-                        # Split sector if it's multi-sector
-                        sectors_to_query_ticket = self.split_multi_sector(sector_value)
+                        # Use sector directly from Excel file (no splitting)
+                        sectors_to_query_ticket = [sector_value]  # Use sector directly without splitting
                         
                         # Build keys for each sector using Ticket_Number as PNR_Number
                         key_values_list_ticket = []
@@ -1380,12 +1527,29 @@ class DataEnricher:
                         # Collect all unique keys
                         all_keys_ticket_as_pnr = []
                         key_to_row_indices_ticket_as_pnr = {}
+                        key_to_pattern_ticket_as_pnr = {}  # Map key -> 'CN' or 'IN' pattern based on GST INVOICE NO
+                        
                         for idx, keys_list in row_keys_ticket_as_pnr.items():
+                            # Get GST INVOICE NO pattern for this row
+                            invoice_pattern = None
+                            if vendor_invoice_col and vendor_invoice_col in batch_df.loc[idx].index:
+                                vendor_invoice_val = batch_df.loc[idx, vendor_invoice_col]
+                                if not self.is_empty_value(vendor_invoice_val):
+                                    vendor_invoice_str = str(vendor_invoice_val).strip().upper()
+                                    if vendor_invoice_str.startswith('CN'):
+                                        invoice_pattern = 'CN'
+                                    elif vendor_invoice_str.startswith('IN'):
+                                        invoice_pattern = 'IN'
+                            
                             for key in keys_list:
                                 if key not in key_to_row_indices_ticket_as_pnr:
                                     all_keys_ticket_as_pnr.append(key)
                                     key_to_row_indices_ticket_as_pnr[key] = []
+                                    key_to_pattern_ticket_as_pnr[key] = None
                                 key_to_row_indices_ticket_as_pnr[key].append(idx)
+                                # Set pattern for key (if multiple rows use same key, use first non-None pattern)
+                                if invoice_pattern and key_to_pattern_ticket_as_pnr[key] is None:
+                                    key_to_pattern_ticket_as_pnr[key] = invoice_pattern
                         
                         unique_keys_ticket_as_pnr = list(dict.fromkeys(all_keys_ticket_as_pnr))
                         
@@ -1398,23 +1562,69 @@ class DataEnricher:
                         # Add NULL checks
                         null_checks_ticket = ' AND '.join([f"`{c}` IS NOT NULL" for c in pnr_sector_combination])
                         
+                        # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
+                        order_by_clause_ticket = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        
                         query_ticket = (
                             f"SELECT {ref_cols_str_ticket}, {missing_columns_str_ticket} "
                             f"FROM `{table_name}` "
                             f"WHERE ({ref_cols_str_ticket}) IN ({placeholders_ticket}) "
-                            f"AND {null_checks_ticket}"
+                            f"AND {null_checks_ticket} "
+                            f"{order_by_clause_ticket}"
                         )
                         params_ticket = [v for key in unique_keys_ticket_as_pnr for v in key]
                         
                         # Execute batch query
                         results_ticket_as_pnr = self.execute_query_with_retry(query_ticket, params_ticket)
                         
-                        # Build lookup dictionary from results
-                        lookup_ticket_as_pnr = {}
+                        # Group results by key first (multiple results per key possible)
+                        results_by_key_ticket_as_pnr = {}
                         for r in results_ticket_as_pnr:
                             key = tuple(r[c] for c in pnr_sector_combination)
-                            if key not in lookup_ticket_as_pnr:
-                                lookup_ticket_as_pnr[key] = {col: r.get(col) for col in missing_columns}
+                            if key not in results_by_key_ticket_as_pnr:
+                                results_by_key_ticket_as_pnr[key] = []
+                            results_by_key_ticket_as_pnr[key].append({col: r.get(col) for col in missing_columns})
+                        
+                        # Build lookup dictionary from results
+                        # Prioritize based on GST INVOICE NO pattern and Original_Invoice_Number
+                        lookup_ticket_as_pnr = {}
+                        for key in results_by_key_ticket_as_pnr:
+                            key_results = results_by_key_ticket_as_pnr[key]
+                            pattern = key_to_pattern_ticket_as_pnr.get(key)
+                            
+                            if pattern == 'CN':
+                                # For CN: prioritize records with Original_Invoice_Number NOT NULL
+                                # If no such record, use Original_Invoice_Number NULL
+                                prioritized_result = None
+                                fallback_result = None
+                                
+                                for result in key_results:
+                                    original_inv_num = result.get('Original_Invoice_Number')
+                                    if not self.is_empty_value(original_inv_num):
+                                        prioritized_result = result
+                                        break
+                                    elif fallback_result is None:
+                                        fallback_result = result
+                                
+                                lookup_ticket_as_pnr[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                            elif pattern == 'IN':
+                                # For IN: prioritize records with Original_Invoice_Number NULL
+                                # If no such record, use Original_Invoice_Number NOT NULL
+                                prioritized_result = None
+                                fallback_result = None
+                                
+                                for result in key_results:
+                                    original_inv_num = result.get('Original_Invoice_Number')
+                                    if self.is_empty_value(original_inv_num):
+                                        prioritized_result = result
+                                        break
+                                    elif fallback_result is None:
+                                        fallback_result = result
+                                
+                                lookup_ticket_as_pnr[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                            else:
+                                # No pattern or unknown pattern: use first result
+                                lookup_ticket_as_pnr[key] = key_results[0]
                         
                         # Match rows with results
                         for idx in rows_with_valid_keys_ticket_as_pnr:
@@ -1592,10 +1802,10 @@ class DataEnricher:
                         df_combined.to_csv(output_path, index=False)
                         logger.info(f"Data saved to: {output_path}")
                         
-                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
-                            logger.info("Splitting data into credit_note and Invoice files...")
-                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
+                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
                                 output_path,
                                 output_directory=os.path.dirname(output_path)
                             )
@@ -1603,8 +1813,21 @@ class DataEnricher:
                                 logger.info(f"Credit note file created: {credit_note_path}")
                             if invoice_path:
                                 logger.info(f"Invoice file created: {invoice_path}")
+                            if zero_path:
+                                logger.info(f"Zero file created: {zero_path}")
+                            
+                            # Process duplicate invoice numbers in each split file
+                            try:
+                                logger.info("Processing duplicate invoice numbers in split files...")
+                                processed_files = process_multiple_files(
+                                    [credit_note_path, invoice_path, zero_path],
+                                    invoice_number_column='Invoice_Number'
+                                )
+                                logger.info("Completed processing duplicate invoice numbers")
+                            except Exception as dedup_error:
+                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
+                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
                     else:
                         # Save each sheet separately in Excel
                         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -1624,10 +1847,10 @@ class DataEnricher:
                         except Exception as date_format_error:
                             logger.warning(f"Could not apply date formatting: {date_format_error}")
                         
-                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
-                            logger.info("Splitting data into credit_note and Invoice files...")
-                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
+                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
                                 output_path,
                                 output_directory=os.path.dirname(output_path)
                             )
@@ -1635,8 +1858,21 @@ class DataEnricher:
                                 logger.info(f"Credit note file created: {credit_note_path}")
                             if invoice_path:
                                 logger.info(f"Invoice file created: {invoice_path}")
+                            if zero_path:
+                                logger.info(f"Zero file created: {zero_path}")
+                            
+                            # Process duplicate invoice numbers in each split file
+                            try:
+                                logger.info("Processing duplicate invoice numbers in split files...")
+                                processed_files = process_multiple_files(
+                                    [credit_note_path, invoice_path, zero_path],
+                                    invoice_number_column='Invoice_Number'
+                                )
+                                logger.info("Completed processing duplicate invoice numbers")
+                            except Exception as dedup_error:
+                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
+                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
                 except Exception as e:
                     logger.error(f"Error saving file: {e}")
             
@@ -1656,10 +1892,10 @@ class DataEnricher:
                         df_enriched.to_csv(output_path, index=False)
                         logger.info(f"Data saved to: {output_path}")
                         
-                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
-                            logger.info("Splitting data into credit_note and Invoice files...")
-                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
+                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
                                 output_path,
                                 output_directory=os.path.dirname(output_path)
                             )
@@ -1667,8 +1903,21 @@ class DataEnricher:
                                 logger.info(f"Credit note file created: {credit_note_path}")
                             if invoice_path:
                                 logger.info(f"Invoice file created: {invoice_path}")
+                            if zero_path:
+                                logger.info(f"Zero file created: {zero_path}")
+                            
+                            # Process duplicate invoice numbers in each split file
+                            try:
+                                logger.info("Processing duplicate invoice numbers in split files...")
+                                processed_files = process_multiple_files(
+                                    [credit_note_path, invoice_path, zero_path],
+                                    invoice_number_column='Invoice_Number'
+                                )
+                                logger.info("Completed processing duplicate invoice numbers")
+                            except Exception as dedup_error:
+                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
+                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
                     else:
                         df_enriched.to_excel(output_path, index=False, engine='openpyxl')
                         logger.info(f"Data saved to: {output_path}")
@@ -1684,10 +1933,10 @@ class DataEnricher:
                         except Exception as date_format_error:
                             logger.warning(f"Could not apply date formatting: {date_format_error}")
                         
-                        # Split data into credit_note and Invoice files based on Vendor K3 Amount
+                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
-                            logger.info("Splitting data into credit_note and Invoice files...")
-                            credit_note_path, invoice_path = split_by_vendor_k3_amount(
+                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
+                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
                                 output_path,
                                 output_directory=os.path.dirname(output_path)
                             )
@@ -1695,8 +1944,21 @@ class DataEnricher:
                                 logger.info(f"Credit note file created: {credit_note_path}")
                             if invoice_path:
                                 logger.info(f"Invoice file created: {invoice_path}")
+                            if zero_path:
+                                logger.info(f"Zero file created: {zero_path}")
+                            
+                            # Process duplicate invoice numbers in each split file
+                            try:
+                                logger.info("Processing duplicate invoice numbers in split files...")
+                                processed_files = process_multiple_files(
+                                    [credit_note_path, invoice_path, zero_path],
+                                    invoice_number_column='Invoice_Number'
+                                )
+                                logger.info("Completed processing duplicate invoice numbers")
+                            except Exception as dedup_error:
+                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note and Invoice files: {split_error}")
+                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
                 except Exception as e:
                     logger.error(f"Error saving file: {e}")
             
