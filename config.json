@@ -45,11 +45,12 @@
     },
     "scheduling": {
         "enabled": true,
-        "time": "16:13:00",
+        "time": "18:40:00",
         "timezone": "IST"
     },
     "paths": {
-        "working_directory": "C:\\Users\\sharm\\OneDrive\\Desktop\\DATA_MERGE6"
+        "working_directory": "C:\\Users\\sharm\\OneDrive\\Desktop\\DATA_MERGE6",
+        "gstr_directory": "D:\\Gst_Files\\GST_2b_3b"
   },
   "sftp": {
     "enabled": false,

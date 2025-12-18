@@ -23,6 +23,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from data_splitter import split_by_vendor_k3_amount
 from invoice_deduplicator import process_multiple_files
+from gstr_2b_3b_merger import merge_gstr_data
 
 # Configure enhanced logging for automated execution
 log_file = f"data_merge_{datetime.now().strftime('%Y%m%d')}.log"
@@ -76,6 +77,7 @@ DEBUG_MODE = CONFIG["debug"]["debug_mode"]
 DEBUG_ID = CONFIG["debug"]["debug_id"]
 SFTP_CONFIG = CONFIG.get("sftp", {})
 EMAIL_CONFIG = CONFIG.get("email", {})
+GSTR_DIRECTORY = CONFIG.get("paths", {}).get("gstr_directory", "")
 
 # Create output directory if it doesn't exist
 os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
@@ -912,7 +914,7 @@ class DataEnricher:
             'Company_GST_Number': ['GST Number', 'gst number', 'GSTNumber', 'GST_Number', 'gst_number'],
             'Booking_Date': ['Booking Date', 'booking date', 'BookingDate', 'Booking_Date', 'booking_date'],
             'Travel_Date': ['Departure Date', 'departure date', 'DepartureDate', 'Departure_Date', 'departure_date', 'Onward Date', 'onward date', 'OnwardDate', 'Travel_Date', 'travel date'],
-            'Passenger_Name': ['LOUIS ARUL AROCKIASAMY', 'louis arul arokiasamy', 'Traveller', 'Traveler_Name', 'traveler name', 'TravelerName', 'Passenger_Name', 'passenger name', 'Passenger Name'],
+            'Passenger_Name': ['LOUIS ARUL AROCKIASAMY', 'louis arul arokiasamy', 'Traveller', 'Traveler_Name', 'traveler name', 'TravelerName', 'Passenger Name', 'passenger name', 'Passenger Name'],
             'PNR': ['Airline Pnr', 'airline pnr', 'Airline PNR', 'Airline PNR/Prov. Booking', 'airline pnr/prov. booking', 'pnrnumber', 'pnr number', 'PNR_Number', 'PNR', 'pnr'],
             'Ticket_Number': ['Airline Ticket No.', 'airline ticket no.', 'Airline Ticket No', 'Ticket Num/Final Booking', 'ticket num/final booking', 'TicketNumber', 'Ticket Number', 'ticket number', 'Ticket_Number'],
             'Vendor Invoice No': ['GST INVOICE NO', 'gst invoice no', 'GST Invoice No', 'GST_INVOICE_NO', 'GSTInvoiceNo', 'GST Invoice Number'],
@@ -1709,6 +1711,25 @@ class DataEnricher:
                         # Use matched data from database
                         complete_row[db_col] = matched_db_data.get(db_col)
                 
+                # Check if Total Fare (Including GST) from Excel differs from Invoice_Total from DB
+                # If different, recalculate Invoice_Total as sum of Taxable_Amount + NonTaxable_Amount + Invoice_Total_GST
+                ticket_amount_value = complete_row.get('Ticket_Amount')
+                invoice_total_value = complete_row.get('Invoice_Total')
+                
+                if ticket_amount_value is not None and invoice_total_value is not None:
+                    try:
+                        excel_amount = float(ticket_amount_value)
+                        db_amount = float(invoice_total_value)
+                        
+                        # If amounts don't match, recalculate
+                        if abs(excel_amount - db_amount) > 0.01:  # Allow small tolerance for float comparison
+                            taxable = float(complete_row.get('Taxable_Amount') or 0)
+                            non_taxable = float(complete_row.get('NonTaxable_Amount') or 0)
+                            total_gst = float(complete_row.get('Invoice_Total_GST') or 0)
+                            complete_row['Invoice_Total'] = taxable + non_taxable + total_gst
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+                
                 enriched_data.append(complete_row)
         
         # Log combination usage statistics
@@ -1802,6 +1823,16 @@ class DataEnricher:
                         df_combined.to_csv(output_path, index=False)
                         logger.info(f"Data saved to: {output_path}")
                         
+                        # Merge GSTR 2B/3B filing status data
+                        try:
+                            if GSTR_DIRECTORY and os.path.exists(GSTR_DIRECTORY):
+                                logger.info("Merging GSTR 2B/3B filing status data...")
+                                merge_gstr_data(output_path, GSTR_DIRECTORY)
+                            else:
+                                logger.warning(f"GSTR directory not found or not configured: {GSTR_DIRECTORY}. Skipping GSTR merge.")
+                        except Exception as gstr_error:
+                            logger.warning(f"Could not merge GSTR data: {gstr_error}")
+                        
                         # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
                             logger.info("Splitting data into credit_note, Invoice, and zero files...")
@@ -1846,6 +1877,22 @@ class DataEnricher:
                             self.format_date_columns(output_path)
                         except Exception as date_format_error:
                             logger.warning(f"Could not apply date formatting: {date_format_error}")
+                        
+                        # Merge GSTR 2B/3B filing status data
+                        try:
+                            if GSTR_DIRECTORY and os.path.exists(GSTR_DIRECTORY):
+                                logger.info("Merging GSTR 2B/3B filing status data...")
+                                merge_gstr_data(output_path, GSTR_DIRECTORY)
+                                # Re-apply formatting after merge
+                                try:
+                                    self.apply_header_formatting(excel_path, output_path)
+                                    self.format_date_columns(output_path)
+                                except Exception as format_error:
+                                    logger.warning(f"Could not re-apply formatting after GSTR merge: {format_error}")
+                            else:
+                                logger.warning(f"GSTR directory not found or not configured: {GSTR_DIRECTORY}. Skipping GSTR merge.")
+                        except Exception as gstr_error:
+                            logger.warning(f"Could not merge GSTR data: {gstr_error}")
                         
                         # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
@@ -1892,6 +1939,16 @@ class DataEnricher:
                         df_enriched.to_csv(output_path, index=False)
                         logger.info(f"Data saved to: {output_path}")
                         
+                        # Merge GSTR 2B/3B filing status data
+                        try:
+                            if GSTR_DIRECTORY and os.path.exists(GSTR_DIRECTORY):
+                                logger.info("Merging GSTR 2B/3B filing status data...")
+                                merge_gstr_data(output_path, GSTR_DIRECTORY)
+                            else:
+                                logger.warning(f"GSTR directory not found or not configured: {GSTR_DIRECTORY}. Skipping GSTR merge.")
+                        except Exception as gstr_error:
+                            logger.warning(f"Could not merge GSTR data: {gstr_error}")
+                        
                         # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
                         try:
                             logger.info("Splitting data into credit_note, Invoice, and zero files...")
@@ -1926,6 +1983,16 @@ class DataEnricher:
                             self.apply_header_formatting(excel_path, output_path)
                         except Exception as format_error:
                             logger.warning(f"Could not apply header formatting: {format_error}")
+                        
+                        # Merge GSTR 2B/3B filing status data
+                        try:
+                            if GSTR_DIRECTORY and os.path.exists(GSTR_DIRECTORY):
+                                logger.info("Merging GSTR 2B/3B filing status data...")
+                                merge_gstr_data(output_path, GSTR_DIRECTORY)
+                            else:
+                                logger.warning(f"GSTR directory not found or not configured: {GSTR_DIRECTORY}. Skipping GSTR merge.")
+                        except Exception as gstr_error:
+                            logger.warning(f"Could not merge GSTR data: {gstr_error}")
                         
                         # Apply date formatting
                         try:
