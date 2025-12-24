@@ -917,8 +917,8 @@ class DataEnricher:
             'Passenger_Name': ['LOUIS ARUL AROCKIASAMY', 'louis arul arokiasamy', 'Traveller', 'Traveler_Name', 'traveler name', 'TravelerName', 'Passenger Name', 'passenger name', 'Passenger Name'],
             'PNR': ['Airline Pnr', 'airline pnr', 'Airline PNR', 'Airline PNR/Prov. Booking', 'airline pnr/prov. booking', 'pnrnumber', 'pnr number', 'PNR_Number', 'PNR', 'pnr'],
             'Ticket_Number': ['Airline Ticket No.', 'airline ticket no.', 'Airline Ticket No', 'Ticket Num/Final Booking', 'ticket num/final booking', 'TicketNumber', 'Ticket Number', 'ticket number', 'Ticket_Number'],
-            'Vendor Invoice No': ['GST INVOICE NO', 'gst invoice no', 'GST Invoice No', 'GST_INVOICE_NO', 'GSTInvoiceNo', 'GST Invoice Number'],
-            'Vendor K3 Amount': ['TOTAL K3', 'total k3', 'Total K3', 'TOTAL_K3', 'TotalK3', 'Total K3 Amount'],
+            'Vendor Invoice No': ['GST INVOICE NO', 'gst invoice no', 'GST Invoice No', 'GST_INVOICE_NO', 'GSTInvoiceNo', 'GST Invoice Number', 'Vendor Invoice Number', 'vendor invoice number', 'Vendor Invoice No', 'vendor invoice no', 'Vendor_Invoice_Number', 'vendor_invoice_number'],
+            'Vendor K3 Amount': ['TOTAL K3', 'total k3', 'Total K3', 'TOTAL_K3', 'TotalK3', 'Total K3 Amount', 'K3', 'k3', 'Vendor K3 Amount', 'vendor k3 amount', 'Vendor_K3_Amount', 'vendor_k3_amount'],
             'Airline_Name': ['Airline Name', 'airline name', 'AirlineName', 'Airline_Name', 'airline_name'],
             'Airline_Code': ['Airline Code', 'airline code', 'AirlineCode', 'airlinecode', 'Airline_Code'],
             'Travel_Mode': ['TRIP TYPE', 'trip type', 'Trip Type', 'TRIP_TYPE', 'TripType', 'Product Type', 'product type', 'ProductType', 'Travel_Mode', 'travel mode'],
@@ -1154,35 +1154,31 @@ class DataEnricher:
                         pattern = key_to_pattern.get(key)
                         
                         if pattern == 'CN':
-                            # For CN: prioritize records with Original_Invoice_Number NOT NULL
-                            # If no such record, use Original_Invoice_Number NULL
-                            prioritized_result = None
-                            fallback_result = None
+                            # For CN: ONLY match records with Original_Invoice_Number NOT NULL
+                            # No fallback - if no matching record, don't add to lookup
+                            matched_result = None
                             
                             for result in key_results:
                                 original_inv_num = result.get('Original_Invoice_Number')
                                 if not self.is_empty_value(original_inv_num):
-                                    prioritized_result = result
+                                    matched_result = result
                                     break
-                                elif fallback_result is None:
-                                    fallback_result = result
                             
-                            lookup[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                            if matched_result is not None:
+                                lookup[key] = matched_result
                         elif pattern == 'IN':
-                            # For IN: prioritize records with Original_Invoice_Number NULL
-                            # If no such record, use Original_Invoice_Number NOT NULL
-                            prioritized_result = None
-                            fallback_result = None
+                            # For IN: ONLY match records with Original_Invoice_Number NULL
+                            # No fallback - if no matching record, don't add to lookup
+                            matched_result = None
                             
                             for result in key_results:
                                 original_inv_num = result.get('Original_Invoice_Number')
                                 if self.is_empty_value(original_inv_num):
-                                    prioritized_result = result
+                                    matched_result = result
                                     break
-                                elif fallback_result is None:
-                                    fallback_result = result
                             
-                            lookup[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                            if matched_result is not None:
+                                lookup[key] = matched_result
                         else:
                             # No pattern or unknown pattern: use first result
                             lookup[key] = key_results[0]
@@ -1380,35 +1376,31 @@ class DataEnricher:
                             pattern = key_to_pattern_fallback.get(key)
                             
                             if pattern == 'CN':
-                                # For CN: prioritize records with Original_Invoice_Number NOT NULL
-                                # If no such record, use Original_Invoice_Number NULL
-                                prioritized_result = None
-                                fallback_result = None
+                                # For CN: ONLY match records with Original_Invoice_Number NOT NULL
+                                # No fallback - if no matching record, don't add to lookup
+                                matched_result = None
                                 
                                 for result in key_results:
                                     original_inv_num = result.get('Original_Invoice_Number')
                                     if not self.is_empty_value(original_inv_num):
-                                        prioritized_result = result
+                                        matched_result = result
                                         break
-                                    elif fallback_result is None:
-                                        fallback_result = result
                                 
-                                lookup_fallback[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                                if matched_result is not None:
+                                    lookup_fallback[key] = matched_result
                             elif pattern == 'IN':
-                                # For IN: prioritize records with Original_Invoice_Number NULL
-                                # If no such record, use Original_Invoice_Number NOT NULL
-                                prioritized_result = None
-                                fallback_result = None
+                                # For IN: ONLY match records with Original_Invoice_Number NULL
+                                # No fallback - if no matching record, don't add to lookup
+                                matched_result = None
                                 
                                 for result in key_results:
                                     original_inv_num = result.get('Original_Invoice_Number')
                                     if self.is_empty_value(original_inv_num):
-                                        prioritized_result = result
+                                        matched_result = result
                                         break
-                                    elif fallback_result is None:
-                                        fallback_result = result
                                 
-                                lookup_fallback[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                                if matched_result is not None:
+                                    lookup_fallback[key] = matched_result
                             else:
                                 # No pattern or unknown pattern: use first result
                                 lookup_fallback[key] = key_results[0]
@@ -1595,35 +1587,31 @@ class DataEnricher:
                             pattern = key_to_pattern_ticket_as_pnr.get(key)
                             
                             if pattern == 'CN':
-                                # For CN: prioritize records with Original_Invoice_Number NOT NULL
-                                # If no such record, use Original_Invoice_Number NULL
-                                prioritized_result = None
-                                fallback_result = None
+                                # For CN: ONLY match records with Original_Invoice_Number NOT NULL
+                                # No fallback - if no matching record, don't add to lookup
+                                matched_result = None
                                 
                                 for result in key_results:
                                     original_inv_num = result.get('Original_Invoice_Number')
                                     if not self.is_empty_value(original_inv_num):
-                                        prioritized_result = result
+                                        matched_result = result
                                         break
-                                    elif fallback_result is None:
-                                        fallback_result = result
                                 
-                                lookup_ticket_as_pnr[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                                if matched_result is not None:
+                                    lookup_ticket_as_pnr[key] = matched_result
                             elif pattern == 'IN':
-                                # For IN: prioritize records with Original_Invoice_Number NULL
-                                # If no such record, use Original_Invoice_Number NOT NULL
-                                prioritized_result = None
-                                fallback_result = None
+                                # For IN: ONLY match records with Original_Invoice_Number NULL
+                                # No fallback - if no matching record, don't add to lookup
+                                matched_result = None
                                 
                                 for result in key_results:
                                     original_inv_num = result.get('Original_Invoice_Number')
                                     if self.is_empty_value(original_inv_num):
-                                        prioritized_result = result
+                                        matched_result = result
                                         break
-                                    elif fallback_result is None:
-                                        fallback_result = result
                                 
-                                lookup_ticket_as_pnr[key] = prioritized_result if prioritized_result is not None else (fallback_result if fallback_result is not None else key_results[0])
+                                if matched_result is not None:
+                                    lookup_ticket_as_pnr[key] = matched_result
                             else:
                                 # No pattern or unknown pattern: use first result
                                 lookup_ticket_as_pnr[key] = key_results[0]
