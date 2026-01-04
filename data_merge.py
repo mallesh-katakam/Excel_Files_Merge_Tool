@@ -18,9 +18,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+# openpyxl removed - no longer copying styling
 from data_splitter import split_by_vendor_k3_amount
 from invoice_deduplicator import process_multiple_files
 from gstr_2b_3b_merger import merge_gstr_data
@@ -235,9 +233,9 @@ class DataEnricher:
                 if file_extension == '.xlsb':
                     engine = 'pyxlsb'
                 elif file_extension == '.xls':
-                    engine = None  # pandas will use xlrd or openpyxl automatically
+                    engine = None  # pandas will use xlrd automatically
                 else:
-                    engine = 'openpyxl'
+                    engine = 'openpyxl'  # openpyxl needed for READING .xlsx files
                 
                 # Read all sheets from Excel file
                 try:
@@ -340,7 +338,48 @@ class DataEnricher:
     
     def is_empty_value(self, value) -> bool:
         """Check if a value is empty/null."""
-        return pd.isna(value) or value is None or (isinstance(value, str) and value.strip() == '')
+        if pd.isna(value) or value is None:
+            return True
+        if isinstance(value, str):
+            # Check for empty string or string representations of null
+            stripped = value.strip().lower()
+            return stripped == '' or stripped == 'null' or stripped == 'none' or stripped == 'nan'
+        return False
+    
+    def convert_excel_date(self, value):
+        """
+        Convert Excel serial date number to actual date using pandas.
+        Returns formatted date string 'YYYY-MM-DD' or original value if not a date.
+        """
+        if value is None or pd.isna(value):
+            return None
+        
+        # If it's already a datetime object, format it
+        if isinstance(value, (pd.Timestamp, datetime)):
+            return value.strftime('%Y-%m-%d')
+        
+        # If it's a string, try to parse it
+        if isinstance(value, str):
+            try:
+                parsed_date = pd.to_datetime(value, errors='coerce')
+                if pd.notna(parsed_date):
+                    return parsed_date.strftime('%Y-%m-%d')
+            except:
+                pass
+            return value
+        
+        # If it's a number, use pandas to convert from Excel serial date
+        if isinstance(value, (int, float)):
+            try:
+                # Use pandas built-in Excel date conversion
+                # origin='1899-12-30' is Excel's epoch
+                if 1 <= value <= 100000:  # Reasonable range for Excel dates
+                    converted_date = pd.to_datetime(value, unit='D', origin='1899-12-30')
+                    return converted_date.strftime('%Y-%m-%d')
+            except:
+                pass
+        
+        return value
     
     def find_column_case_insensitive(self, column_name: str, excel_columns: List[str]) -> Optional[str]:
         """Find a column name in Excel columns using case-insensitive matching."""
@@ -493,317 +532,26 @@ class DataEnricher:
     def apply_header_formatting(self, original_excel_path: str, output_excel_path: str, 
                                 header_row_index: int = 1) -> bool:
         """
-        Apply header row formatting, column widths, and row heights from original Excel file to output file.
-        Optimized to only modify header row and dimensions, preserving all other formatting.
-        Handles multiple sheets by matching sheet names.
-        
-        Args:
-            original_excel_path: Path to original Excel file
-            output_excel_path: Path to output Excel file
-            header_row_index: Row index for header (1-based, default 1)
-        
-        Returns:
-            bool: True if successful, False otherwise
+        Header formatting has been disabled (openpyxl removed).
+        This function now does nothing and returns True.
         """
-        try:
-            # Skip formatting for .xlsb files as openpyxl doesn't support them
-            original_ext = os.path.splitext(original_excel_path)[1].lower()
-            if original_ext == '.xlsb':
-                logger.info("Skipping header formatting for .xlsb file (openpyxl doesn't support .xlsb format)")
-                return False
-            
-            # Load original file to get header formatting
-            original_wb = load_workbook(original_excel_path, read_only=False, data_only=False)
-            # Load output file for writing
-            output_wb = load_workbook(output_excel_path)
-            
-            # Process each sheet in output file
-            for sheet_name in output_wb.sheetnames:
-                if sheet_name in original_wb.sheetnames:
-                    original_ws = original_wb[sheet_name]
-                    output_ws = output_wb[sheet_name]
-                    self._apply_sheet_formatting(original_ws, output_ws, header_row_index)
-                else:
-                    # If sheet doesn't exist in original, use first sheet as template
-                    original_ws = original_wb.active
-                    output_ws = output_wb[sheet_name]
-                    self._apply_sheet_formatting(original_ws, output_ws, header_row_index)
-            
-            # Save the formatted output file
-            output_wb.save(output_excel_path)
-            output_wb.close()
-            original_wb.close()
-            
-            logger.info(f"Applied header formatting from original file to output")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Could not apply header formatting: {e}")
-            try:
-                if 'output_wb' in locals():
-                    output_wb.close()
-                if 'original_wb' in locals():
-                    original_wb.close()
-            except Exception:
-                pass
-            return False
+        logger.info("Header formatting skipped (openpyxl removed)")
+        return True
     
     def _apply_sheet_formatting(self, original_ws, output_ws, header_row_index: int):
-        """Helper method to apply formatting to a single sheet."""
-        # Find header row in original file (search first few rows)
-        original_header_row = None
-        for row_idx in range(1, min(11, original_ws.max_row + 1)):
-            row = original_ws[row_idx]
-            # Check if this row has mostly text values (likely header)
-            text_count = sum(1 for cell in row if cell.value and isinstance(cell.value, str))
-            if text_count >= len(row) * 0.5:  # At least 50% text
-                original_header_row = row_idx
-                break
-        
-        if original_header_row is None:
-            original_header_row = 1  # Default to first row
-        
-        # Copy column widths from original to output
-        # Strategy: Match by header name first, then by position for existing columns
-        # For new columns at the end, use average width or default
-        
-        # Map original columns by header name and position
-        original_headers_by_name = {}
-        original_widths_by_pos = {}
-        
-        for col_idx in range(1, original_ws.max_column + 1):
-            col_letter = get_column_letter(col_idx)
-            cell = original_ws.cell(row=original_header_row, column=col_idx)
-            if cell.value:
-                header_name = str(cell.value).strip()
-                original_headers_by_name[header_name] = col_idx
-            
-            # Store width by position (even if no header)
-            if col_letter in original_ws.column_dimensions:
-                width = original_ws.column_dimensions[col_letter].width
-                if width and width > 0:
-                    original_widths_by_pos[col_idx] = width
-        
-        # Map output columns by header name
-        output_headers_by_name = {}
-        for col_idx in range(1, output_ws.max_column + 1):
-            cell = output_ws.cell(row=header_row_index, column=col_idx)
-            if cell.value:
-                header_name = str(cell.value).strip()
-                output_headers_by_name[header_name] = col_idx
-        
-        # Calculate default width (average of original widths, or 12.0)
-        widths_list = [w for w in original_widths_by_pos.values() if w > 0]
-        default_width = sum(widths_list) / len(widths_list) if widths_list else 12.0
-        
-        # Copy widths: first match by header name, then by position
-        for out_col_idx in range(1, output_ws.max_column + 1):
-            out_col_letter = get_column_letter(out_col_idx)
-            out_cell = output_ws.cell(row=header_row_index, column=out_col_idx)
-            out_header_name = str(out_cell.value).strip() if out_cell.value else None
-            
-            width_to_apply = None
-            
-            # Try to match by header name first
-            if out_header_name and out_header_name in original_headers_by_name:
-                orig_col_idx = original_headers_by_name[out_header_name]
-                orig_col_letter = get_column_letter(orig_col_idx)
-                if orig_col_letter in original_ws.column_dimensions:
-                    width_to_apply = original_ws.column_dimensions[orig_col_letter].width
-            
-            # If no match by name, try by position (for existing columns)
-            if (width_to_apply is None or width_to_apply == 0) and out_col_idx <= original_ws.max_column:
-                width_to_apply = original_widths_by_pos.get(out_col_idx)
-            
-            # If still no width, use default (for new columns)
-            if width_to_apply is None or width_to_apply == 0:
-                width_to_apply = default_width
-            
-            # Apply the width
-            output_ws.column_dimensions[out_col_letter].width = width_to_apply
-        
-        # Copy header row height from original file
-        if original_header_row in original_ws.row_dimensions:
-            orig_row_height = original_ws.row_dimensions[original_header_row].height
-            if orig_row_height and orig_row_height > 0:
-                output_ws.row_dimensions[header_row_index].height = orig_row_height
-        
-        # Get formatting from first existing header cell in original file
-        sample_cell = None
-        for col_idx in range(1, original_ws.max_column + 1):
-            cell = original_ws.cell(row=original_header_row, column=col_idx)
-            if cell.value:  # Find first non-empty cell
-                sample_cell = cell
-                break
-        
-        if sample_cell is None:
-            # If no sample found, try to get any cell from header row
-            if original_ws.max_column > 0:
-                sample_cell = original_ws.cell(row=original_header_row, column=1)
-        
-        # Apply formatting to all header cells in output file
-        if sample_cell:
-            # Copy style properties from sample cell
-            header_fill = None
-            if sample_cell.fill and hasattr(sample_cell.fill, 'start_color'):
-                fill_color = sample_cell.fill.start_color
-                # Check if fill has a meaningful color (not default/transparent)
-                if fill_color and (fill_color.index not in [None, '00000000', 'FFFFFFFF'] or 
-                                  (hasattr(fill_color, 'rgb') and fill_color.rgb)):
-                    header_fill = sample_cell.fill
-            
-            header_font = sample_cell.font if sample_cell.font else None
-            header_alignment = sample_cell.alignment if sample_cell.alignment else None
-            header_border = sample_cell.border if sample_cell.border else None
-            
-            # Apply to all columns in output header row (including new columns)
-            for col_idx in range(1, output_ws.max_column + 1):
-                cell = output_ws.cell(row=header_row_index, column=col_idx)
-                
-                # Apply fill (background color)
-                if header_fill:
-                    try:
-                        # Try to copy the fill object directly (more reliable)
-                        if hasattr(header_fill, 'copy'):
-                            cell.fill = header_fill.copy()
-                        else:
-                            cell.fill = PatternFill(
-                                fill_type=header_fill.fill_type,
-                                start_color=header_fill.start_color,
-                                end_color=header_fill.end_color
-                            )
-                    except Exception as fill_err:
-                        logger.debug(f"Could not copy fill style: {fill_err}")
-                        pass
-                
-                # Apply font
-                if header_font:
-                    try:
-                        cell.font = Font(
-                            name=header_font.name or 'Calibri',
-                            size=header_font.size or 11,
-                            bold=header_font.bold,
-                            italic=header_font.italic,
-                            underline=header_font.underline,
-                            strike=header_font.strike,
-                            color=header_font.color
-                        )
-                    except Exception:
-                        pass
-                
-                # Apply alignment
-                if header_alignment:
-                    try:
-                        cell.alignment = Alignment(
-                            horizontal=header_alignment.horizontal or 'general',
-                            vertical=header_alignment.vertical or 'bottom',
-                            wrap_text=header_alignment.wrap_text,
-                            shrink_to_fit=header_alignment.shrink_to_fit,
-                            indent=header_alignment.indent
-                        )
-                    except Exception:
-                        pass
-                
-                # Apply border
-                if header_border:
-                    try:
-                        cell.border = Border(
-                            left=header_border.left,
-                            right=header_border.right,
-                            top=header_border.top,
-                            bottom=header_border.bottom
-                        )
-                    except Exception:
-                        pass
+        """
+        Sheet formatting has been disabled (openpyxl removed).
+        This function now does nothing.
+        """
+        pass
     
     def format_date_columns(self, output_excel_path: str, header_row_index: int = 1) -> bool:
         """
-        Format date columns in the output Excel file to display as dd-mm-yyyy.
-        
-        Args:
-            output_excel_path: Path to output Excel file
-            header_row_index: Row index for header (1-based, default 1)
-        
-        Returns:
-            bool: True if successful, False otherwise
+        Date column formatting has been disabled (openpyxl removed).
+        This function now does nothing and returns True.
         """
-        try:
-            # List of date column names to format (exact matches and partial matches)
-            date_columns = [
-                'Booking_Date', 'Booking Date', 'booking date',
-                'Travel_Date', 'Travel Date', 'travel date', 'Departure Date', 'departure date',
-                'Invoice_Received_Date', 'Invoice Received Date', 'invoice received date',
-                'Invoice_Date', 'Invoice Date', 'invoice date', 'Date Of Invoice', 'date of invoice',
-                'Original_Invoice_Date', 'Original Invoice Date', 'original invoice date'
-            ]
-            
-            # Also check for columns containing "date" keyword
-            date_keywords = ['date', 'Date', 'DATE']
-            
-            # Load output file
-            output_wb = load_workbook(output_excel_path)
-            
-            # Process each sheet
-            for sheet_name in output_wb.sheetnames:
-                output_ws = output_wb[sheet_name]
-                
-                # Find date columns by header name
-                date_col_indices = []
-                for col_idx in range(1, output_ws.max_column + 1):
-                    cell = output_ws.cell(row=header_row_index, column=col_idx)
-                    if cell.value:
-                        header_name = str(cell.value).strip()
-                        header_lower = header_name.lower()
-                        
-                        # Check if this header matches any date column (case-insensitive)
-                        is_date_column = False
-                        for date_col in date_columns:
-                            if date_col.lower() in header_lower or header_lower in date_col.lower():
-                                is_date_column = True
-                                break
-                        
-                        # Also check if header contains "date" keyword (but not "update", "validate", etc.)
-                        if not is_date_column:
-                            if 'date' in header_lower and not any(word in header_lower for word in ['update', 'validate', 'created', 'modified']):
-                                is_date_column = True
-                        
-                        if is_date_column:
-                            date_col_indices.append(col_idx)
-                            logger.info(f"Found date column: {header_name} at column {col_idx}")
-                
-                # Apply date formatting to all rows in date columns
-                date_format = 'dd-mm-yyyy'
-                for col_idx in date_col_indices:
-                    col_letter = get_column_letter(col_idx)
-                    formatted_count = 0
-                    # Format all data rows (skip header row)
-                    for row_idx in range(header_row_index + 1, output_ws.max_row + 1):
-                        cell = output_ws.cell(row=row_idx, column=col_idx)
-                        # Only format if cell has a value
-                        if cell.value is not None:
-                            # Apply date format to all non-empty cells in date columns
-                            # This will format both Excel date serials and datetime objects
-                            cell.number_format = date_format
-                            formatted_count += 1
-                    
-                    if formatted_count > 0:
-                        logger.info(f"Formatted {formatted_count} date cells in column {col_letter}")
-            
-            # Save the formatted file
-            output_wb.save(output_excel_path)
-            output_wb.close()
-            
-            logger.info(f"Applied date formatting to output file")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Could not apply date formatting: {e}")
-            try:
-                if 'output_wb' in locals():
-                    output_wb.close()
-            except Exception:
-                pass
-            return False
+        logger.info("Date column formatting skipped (openpyxl removed)")
+        return True
     
     def _enrich_single_dataframe(self, df_excel: pd.DataFrame, table_name: str,
                                  possible_reference_combinations: List[List[str]],
@@ -935,8 +683,7 @@ class DataEnricher:
         # Numeric columns that should be aggregated when multiple sectors are present
         numeric_columns_to_aggregate = [
             'Taxable_Amount', 'NonTaxable_Amount', 'Cgst_Total', 'Sgst_Total', 
-            'Igst_Total', 'Invoice_Total_GST', 'Invoice_Total', 'Igst_Rate', 
-            'Cgst_Rate', 'Sgst_Rate'
+            'Igst_Total', 'Invoice_Total_GST', 'Invoice_Total'
         ]
         
         # We need to fetch ALL DB columns from database (even if they exist in Excel)
@@ -1014,10 +761,10 @@ class DataEnricher:
                     if has_sector and sector_excel_col and sector_excel_col in row.index:
                         sector_value = row[sector_excel_col]
                     
-                    # Use sector directly from Excel file (no splitting)
+                    # Split multi-sector routes by '/' and query each sector separately
                     sectors_to_query = []
                     if has_sector and sector_value and not self.is_empty_value(sector_value):
-                        sectors_to_query = [sector_value]  # Use sector directly without splitting
+                        sectors_to_query = self.split_multi_sector(sector_value)  # Split by '/' to get individual sectors
                     else:
                         sectors_to_query = [None]  # Single query without sector
                     
@@ -1210,6 +957,14 @@ class DataEnricher:
                                                 except (ValueError, TypeError):
                                                     pass
                                         aggregated_data[col] = total if total != 0 else None
+                                    elif col == 'Public_File_URL':
+                                        # Special handling: Collect all Public_File_URL values separated by comma
+                                        url_list = []
+                                        for result in all_results:
+                                            val = result.get('Public_File_URL')
+                                            if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
+                                                url_list.append(str(val).strip())
+                                        aggregated_data[col] = ', '.join(url_list) if url_list else None
                                     else:
                                         # For non-numeric columns, take first non-null value
                                         for result in all_results:
@@ -1430,6 +1185,14 @@ class DataEnricher:
                                                     except (ValueError, TypeError):
                                                         pass
                                             aggregated_data_fallback[col] = total if total != 0 else None
+                                        elif col == 'Public_File_URL':
+                                            # Special handling: Collect all Public_File_URL values separated by comma
+                                            url_list = []
+                                            for result in all_results_fallback:
+                                                val = result.get('Public_File_URL')
+                                                if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
+                                                    url_list.append(str(val).strip())
+                                            aggregated_data_fallback[col] = ', '.join(url_list) if url_list else None
                                         else:
                                             # For non-numeric columns, take first non-null value
                                             for result in all_results_fallback:
@@ -1503,8 +1266,8 @@ class DataEnricher:
                         if self.is_empty_value(sector_value):
                             continue
                         
-                        # Use sector directly from Excel file (no splitting)
-                        sectors_to_query_ticket = [sector_value]  # Use sector directly without splitting
+                        # Split multi-sector routes by '/' and query each sector separately
+                        sectors_to_query_ticket = self.split_multi_sector(sector_value)  # Split by '/' to get individual sectors
                         
                         # Build keys for each sector using Ticket_Number as PNR_Number
                         key_values_list_ticket = []
@@ -1641,6 +1404,14 @@ class DataEnricher:
                                                     except (ValueError, TypeError):
                                                         pass
                                             aggregated_data_ticket[col] = total if total != 0 else None
+                                        elif col == 'Public_File_URL':
+                                            # Special handling: Collect all Public_File_URL values separated by comma
+                                            url_list = []
+                                            for result in all_results_ticket:
+                                                val = result.get('Public_File_URL')
+                                                if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
+                                                    url_list.append(str(val).strip())
+                                            aggregated_data_ticket[col] = ', '.join(url_list) if url_list else None
                                         else:
                                             # For non-numeric columns, take first non-null value
                                             for result in all_results_ticket:
@@ -1691,7 +1462,13 @@ class DataEnricher:
                         
                         if excel_col_found and excel_col_found in row_data:
                             # For Excel-only columns, use output_col as the key directly
-                            complete_row[output_col] = row_data[excel_col_found]
+                            value = row_data[excel_col_found]
+                            
+                            # Apply date conversion for date columns
+                            if output_col in ['Booking_Date', 'Travel_Date']:
+                                value = self.convert_excel_date(value)
+                            
+                            complete_row[output_col] = value
                         else:
                             complete_row[output_col] = None
                     else:
@@ -1849,7 +1626,7 @@ class DataEnricher:
                             logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
                     else:
                         # Save each sheet separately in Excel
-                        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
                             for sheet_name, df_enriched in enriched_sheets.items():
                                 df_enriched.to_excel(writer, sheet_name=sheet_name, index=False)
                         logger.info(f"Data saved to {output_path} with {len(enriched_sheets)} sheets")
@@ -1964,7 +1741,7 @@ class DataEnricher:
                         except Exception as split_error:
                             logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
                     else:
-                        df_enriched.to_excel(output_path, index=False, engine='openpyxl')
+                        df_enriched.to_excel(output_path, index=False, engine='xlsxwriter')
                         logger.info(f"Data saved to: {output_path}")
                         
                         try:

@@ -104,7 +104,7 @@ def process_duplicate_invoice_numbers(
         if file_ext == '.csv':
             df.to_csv(output_file_path, index=False)
         else:
-            df.to_excel(output_file_path, index=False, engine='openpyxl')
+            df.to_excel(output_file_path, index=False, engine='xlsxwriter')
         
         logger.info(f"Processed file saved: {output_file_path}")
         return output_file_path

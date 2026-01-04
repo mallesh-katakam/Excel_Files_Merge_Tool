@@ -95,7 +95,7 @@ def split_by_vendor_k3_amount(
             if file_ext == '.csv':
                 invoice_df.to_csv(invoice_path, index=False)
             else:
-                invoice_df.to_excel(invoice_path, index=False, engine='openpyxl')
+                invoice_df.to_excel(invoice_path, index=False, engine='xlsxwriter')
             logger.info(f"Invoice file saved: {invoice_path} ({len(invoice_df)} rows)")
         else:
             logger.info(f"No invoice records found. Skipping invoice file creation.")
@@ -106,7 +106,7 @@ def split_by_vendor_k3_amount(
             if file_ext == '.csv':
                 credit_note_df.to_csv(credit_note_path, index=False)
             else:
-                credit_note_df.to_excel(credit_note_path, index=False, engine='openpyxl')
+                credit_note_df.to_excel(credit_note_path, index=False, engine='xlsxwriter')
             logger.info(f"Credit note file saved: {credit_note_path} ({len(credit_note_df)} rows)")
         else:
             logger.info(f"No credit note records found. Skipping credit note file creation.")
@@ -117,7 +117,7 @@ def split_by_vendor_k3_amount(
             if file_ext == '.csv':
                 zero_df.to_csv(zero_path, index=False)
             else:
-                zero_df.to_excel(zero_path, index=False, engine='openpyxl')
+                zero_df.to_excel(zero_path, index=False, engine='xlsxwriter')
             logger.info(f"Zero file saved: {zero_path} ({len(zero_df)} rows)")
         else:
             logger.info(f"No zero records found. Skipping zero file creation.")
@@ -193,7 +193,7 @@ def split_dataframe_by_vendor_k3_amount(
             if file_extension == '.csv':
                 invoice_df.to_csv(invoice_path, index=False)
             else:
-                invoice_df.to_excel(invoice_path, index=False, engine='openpyxl')
+                invoice_df.to_excel(invoice_path, index=False, engine='xlsxwriter')
             logger.info(f"Invoice file saved: {invoice_path} ({len(invoice_df)} rows)")
         else:
             logger.info(f"No invoice records found. Skipping invoice file creation.")
@@ -204,7 +204,7 @@ def split_dataframe_by_vendor_k3_amount(
             if file_extension == '.csv':
                 credit_note_df.to_csv(credit_note_path, index=False)
             else:
-                credit_note_df.to_excel(credit_note_path, index=False, engine='openpyxl')
+                credit_note_df.to_excel(credit_note_path, index=False, engine='xlsxwriter')
             logger.info(f"Credit note file saved: {credit_note_path} ({len(credit_note_df)} rows)")
         else:
             logger.info(f"No credit note records found. Skipping credit note file creation.")
@@ -215,7 +215,7 @@ def split_dataframe_by_vendor_k3_amount(
             if file_extension == '.csv':
                 zero_df.to_csv(zero_path, index=False)
             else:
-                zero_df.to_excel(zero_path, index=False, engine='openpyxl')
+                zero_df.to_excel(zero_path, index=False, engine='xlsxwriter')
             logger.info(f"Zero file saved: {zero_path} ({len(zero_df)} rows)")
         else:
             logger.info(f"No zero records found. Skipping zero file creation.")

@@ -45,7 +45,7 @@
     },
     "scheduling": {
         "enabled": true,
-        "time": "18:52:00",
+        "time": "23:59:00",
         "timezone": "IST"
     },
     "paths": {

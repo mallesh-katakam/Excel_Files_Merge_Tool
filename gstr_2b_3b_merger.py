@@ -402,7 +402,7 @@ def merge_gstr_data(output_file_path: str, gstr_directory: str) -> bool:
                 return False
             
             # Save all sheets back
-            with pd.ExcelWriter(output_file_path, engine='openpyxl') as writer:
+            with pd.ExcelWriter(output_file_path, engine='xlsxwriter') as writer:
                 for sheet_name, df_sheet in output_sheets.items():
                     df_sheet.to_excel(writer, sheet_name=sheet_name, index=False)
             
