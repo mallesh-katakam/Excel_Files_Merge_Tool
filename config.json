@@ -24,9 +24,7 @@
         "Ticket Num/Final Booking": "Ticket_Number",
         "Ticket Number": "Ticket_Number",
         "Airline Ticket No.": "Ticket_Number",
-        "airline ticket no.": "Ticket_Number",
-        "ticketnumber": "Ticket_Number",
-        "ticket number": "Ticket_Number"
+        "ticketnumber": "Ticket_Number"
     },
     "possible_reference_combinations": [
         ["PNR_Number", "Airline_Code", "Travel_Sector"],
@@ -45,7 +43,7 @@
     },
     "scheduling": {
         "enabled": true,
-        "time": "23:59:00",
+        "time": "11:21:30",
         "timezone": "IST"
     },
     "paths": {

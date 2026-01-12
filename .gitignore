@@ -4,26 +4,72 @@ __pycache__/
 *$py.class
 *.so
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Logs
-*.log
-
-# Environment variables
-.env
-.venv
-env/
+# Virtual Environment
 venv/
+env/
+ENV/
+.venv
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS
+*~
 .DS_Store
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+.env.local
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls
+~$*.xlsb
+
+# Output files (optional - uncomment if you don't want to track processed files)
+# processed/
+# *_enriched_*.xlsx
+# *_enriched_*.csv
+# *_Invoice.*
+# *_credit_note.*
+# *_zero.*
+
+# Windows
 Thumbs.db
+desktop.ini
 
-# Sensitive config (uncomment if you want to exclude config.json)
-# config.json
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
 
+# Distribution / packaging
+.Python
+*.manifest
+*.spec

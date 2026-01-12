@@ -187,32 +187,13 @@ def merge_gstr_data(output_file_path: str, gstr_directory: str) -> bool:
         logger.info(f"Created Note Number mapping for {len(gstr_note_mapping)} entries (for Vendor K3 Amount < 0)")
         logger.info(f"Created Invoice Number mapping for {len(gstr_invoice_mapping)} entries (for Vendor K3 Amount > 0)")
         
-        # Log sample invoice numbers for debugging
-        test_invoice = normalize_invoice_number("TN1252609BE34271")
-        
         if gstr_invoice_mapping:
-            sample_invoices = list(gstr_invoice_mapping.keys())[:10]
-            logger.info(f"Sample Invoice Numbers in GSTR mapping (first 10): {sample_invoices}")
-            # Check for specific invoice number mentioned by user
-            if test_invoice in gstr_invoice_mapping:
-                logger.info(f"[OK] Found test invoice '{test_invoice}' in GSTR Invoice Number mapping")
-                logger.info(f"  GSTR 2B Status: {gstr_invoice_mapping[test_invoice]['GSTR_2B_Filing_Status']}")
-                logger.info(f"  GSTR 3B Status: {gstr_invoice_mapping[test_invoice]['GSTR_3B_Filing_Status']}")
-            else:
-                logger.warning(f"[NOT FOUND] Test invoice '{test_invoice}' NOT found in GSTR Invoice Number mapping")
-                # Check for partial matches
-                matching_keys = [k for k in gstr_invoice_mapping.keys() if "TN1252609BE34271" in k or k in "TN1252609BE34271"]
-                if matching_keys:
-                    logger.warning(f"  But found similar keys: {matching_keys[:5]}")
+            sample_invoices = list(gstr_invoice_mapping.keys())[:5]
+            logger.debug(f"Sample Invoice Numbers in GSTR mapping: {sample_invoices}")
         
         if gstr_note_mapping:
-            sample_notes = list(gstr_note_mapping.keys())[:10]
-            logger.info(f"Sample Note Numbers in GSTR mapping (first 10): {sample_notes}")
-            # Check for specific invoice number in note mapping too
-            if test_invoice in gstr_note_mapping:
-                logger.info(f"[OK] Found test invoice '{test_invoice}' in GSTR Note Number mapping")
-            else:
-                logger.info(f"  Test invoice '{test_invoice}' not in Note Number mapping (expected for invoices)")
+            sample_notes = list(gstr_note_mapping.keys())[:5]
+            logger.debug(f"Sample Note Numbers in GSTR mapping: {sample_notes}")
         
         # Helper function to merge GSTR data into a DataFrame
         def merge_gstr_into_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
@@ -239,42 +220,6 @@ def merge_gstr_data(output_file_path: str, gstr_directory: str) -> bool:
                 return df, 0
             
             logger.info(f"Using invoice number column: '{invoice_num_col}'")
-            
-            # Log sample invoice numbers from output file for debugging
-            sample_output_invoices = []
-            test_invoice_normalized = normalize_invoice_number("TN1252609BE34271")
-            test_invoice_found_in_sample = False
-            
-            for idx, row in df.head(20).iterrows():
-                inv_num = row[invoice_num_col]
-                if pd.notna(inv_num):
-                    normalized = normalize_invoice_number(inv_num)
-                    if normalized:
-                        sample_output_invoices.append(normalized)
-                        if normalized == test_invoice_normalized:
-                            test_invoice_found_in_sample = True
-                            logger.info(f"[OK] Found test invoice '{test_invoice_normalized}' in output file at row {idx} (in first 20 rows)")
-            
-            if sample_output_invoices:
-                logger.info(f"Sample Invoice Numbers from output file (first 20): {sample_output_invoices[:10]}")
-            
-            if not test_invoice_found_in_sample:
-                logger.warning(f"[NOT FOUND] Test invoice '{test_invoice_normalized}' NOT found in first 20 rows of output file")
-                # Check all rows for test invoice
-                logger.info("Checking all rows for test invoice...")
-                found_count = 0
-                for idx, row in df.iterrows():
-                    inv_num = row[invoice_num_col]
-                    if pd.notna(inv_num):
-                        normalized = normalize_invoice_number(inv_num)
-                        if normalized == test_invoice_normalized:
-                            found_count += 1
-                            if found_count == 1:
-                                logger.info(f"  Found test invoice at row {idx}, Vendor K3: {row[vendor_k3_col] if vendor_k3_col else 'N/A'}")
-                if found_count > 0:
-                    logger.info(f"  Total occurrences of test invoice in output file: {found_count}")
-                else:
-                    logger.warning(f"  Test invoice '{test_invoice_normalized}' NOT found anywhere in output file")
             
             # Merge data based on Vendor K3 Amount
             merged_count = 0
@@ -317,28 +262,11 @@ def merge_gstr_data(output_file_path: str, gstr_directory: str) -> bool:
                         df.at[idx, 'GSTR_3B_Filing_Status'] = gstr_data['GSTR_3B_Filing_Status']
                         merged_count += 1
                         matched = True
-                        # Log successful match for test invoice
-                        if invoice_num_normalized == normalize_invoice_number("TN1252609BE34271"):
-                            logger.info(f"SUCCESS: Matched invoice '{invoice_num_normalized}' at row {idx} with Vendor K3={vendor_k3_float}")
-                            logger.info(f"  GSTR 2B Status: {gstr_data['GSTR_2B_Filing_Status']}")
-                            logger.info(f"  GSTR 3B Status: {gstr_data['GSTR_3B_Filing_Status']}")
                 
                 # Track unmatched invoice numbers for debugging
                 if not matched and vendor_k3_float != 0:
                     not_found_count += 1
-                    # Special logging for test invoice
-                    if invoice_num_normalized == normalize_invoice_number("TN1252609BE34271"):
-                        logger.warning(f"FAILED: Invoice '{invoice_num_normalized}' NOT matched at row {idx}")
-                        logger.warning(f"  Vendor K3 Amount: {vendor_k3_float}")
-                        logger.warning(f"  Looking in mapping: {'gstr_note_mapping' if vendor_k3_float < 0 else 'gstr_invoice_mapping'}")
-                        logger.warning(f"  Available keys in mapping: {len(gstr_note_mapping if vendor_k3_float < 0 else gstr_invoice_mapping)}")
-                        if vendor_k3_float > 0:
-                            # Check if it exists with different normalization
-                            logger.warning(f"  Checking if exists with different case/spacing...")
-                            for key in list(gstr_invoice_mapping.keys())[:20]:
-                                if "TN1252609BE34271" in key or key in "TN1252609BE34271":
-                                    logger.warning(f"    Found similar key: '{key}'")
-                    elif len(sample_not_found) < 10:
+                    if len(sample_not_found) < 10:
                         sample_not_found.append({
                             'invoice': invoice_num_normalized,
                             'vendor_k3': vendor_k3_float,
@@ -346,32 +274,10 @@ def merge_gstr_data(output_file_path: str, gstr_directory: str) -> bool:
                         })
             
             if sample_not_found:
-                logger.warning(f"Sample unmatched invoice numbers (first 10): {sample_not_found}")
-            logger.warning(f"Total unmatched invoice numbers: {not_found_count}")
+                logger.debug(f"Sample unmatched invoice numbers (first 10): {sample_not_found}")
+            if not_found_count > 0:
+                logger.warning(f"Total unmatched invoice numbers: {not_found_count}")
             logger.info(f"Successfully merged GSTR data for {merged_count} rows")
-            
-            # Additional debug: Check if test invoice exists in output file
-            test_invoice_normalized = normalize_invoice_number("TN1252609BE34271")
-            test_invoice_found_in_output = False
-            test_invoice_row_info = None
-            for idx, row in df.iterrows():
-                inv_num = row[invoice_num_col]
-                inv_normalized = normalize_invoice_number(inv_num)
-                if inv_normalized == test_invoice_normalized:
-                    test_invoice_found_in_output = True
-                    test_invoice_row_info = {
-                        'row_idx': idx,
-                        'invoice': inv_normalized,
-                        'vendor_k3': row[vendor_k3_col] if vendor_k3_col else None,
-                        'gstr_2b': row.get('GSTR_2B_Filing_Status', ''),
-                        'gstr_3b': row.get('GSTR_3B_Filing_Status', '')
-                    }
-                    break
-            
-            if test_invoice_found_in_output:
-                logger.info(f"Test invoice '{test_invoice_normalized}' found in output file: {test_invoice_row_info}")
-            else:
-                logger.warning(f"Test invoice '{test_invoice_normalized}' NOT found in output file")
             
             return df, merged_count
         

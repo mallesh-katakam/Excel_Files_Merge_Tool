@@ -1,4 +1,8 @@
-#automation and new changes  added cost related columns only and changed to access from config file 
+"""
+Data Merge Tool - Production Version
+Automated data enrichment tool for processing Excel/CSV files with database information.
+Supports multi-file processing, automated scheduling, SFTP integration, and email notifications.
+"""
 import pandas as pd
 import mysql.connector
 from mysql.connector import Error
@@ -18,10 +22,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-# openpyxl removed - no longer copying styling
 from data_splitter import split_by_vendor_k3_amount
 from invoice_deduplicator import process_multiple_files
 from gstr_2b_3b_merger import merge_gstr_data
+from fcm_parser import is_fcm_file, parse_fcm_sector, parse_fcm_pnr_or_ticket, generate_fcm_ticket_variations
 
 # Configure enhanced logging for automated execution
 log_file = f"data_merge_{datetime.now().strftime('%Y%m%d')}.log"
@@ -168,6 +172,7 @@ class DataEnricher:
         self.debug_mode = debug_mode
         self.debug_id = debug_id
         self.connection_attempts = 0
+        self.current_file_path = None  # Track current file being processed for FCM detection
     
     def connect(self) -> bool:
         """Establish connection to MySQL database with retry logic."""
@@ -394,21 +399,56 @@ class DataEnricher:
         if self.debug_mode:
             logger.info(f"[DEBUG] {message}")
     
+    def normalize_pnr_ticket_value(self, value, column_type: str) -> str:
+        """
+        Normalize PNR or Ticket Number value.
+        For FCM files, removes suffix after '-' (e.g., 'Q7W2QG-1/1' -> 'Q7W2QG').
+        
+        Args:
+            value: The PNR or ticket value to normalize
+            column_type: Type of column ('PNR_Number' or 'Ticket_Number')
+            
+        Returns:
+            Normalized value as string
+        """
+        if self.is_empty_value(value):
+            return str(value) if value else ''
+        
+        value_str = str(value).strip()
+        
+        # Check if current file is an FCM file
+        if self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
+            # Use FCM parser for PNR/Ticket number cleaning
+            return parse_fcm_pnr_or_ticket(value_str)
+        
+        # Return as-is for non-FCM files
+        return value_str
+    
     def split_multi_sector(self, sector: str) -> List[str]:
         """
         Split multi-sector route into individual sectors by '/' separator.
-        Examples:
+        For FCM files, uses single alphabetic characters as delimiters instead.
+        
+        Standard Examples:
             'MAA-HYD' -> ['MAA-HYD'] (no '/', returns as single sector)
             'MAA-HYD/HYD-MAA' -> ['MAA-HYD', 'HYD-MAA'] (split by '/')
             'MAA-HYD/BLR-DEL/MAA-BOM' -> ['MAA-HYD', 'BLR-DEL', 'MAA-BOM'] (split by '/')
-        If sector has no '/', returns original sector as single-item list.
+        
+        FCM File Examples:
+            'PHL-DOH-T-DOH-BOM-T' -> ['PHL-DOH', 'DOH-BOM']
+            'MAA-BOM-U-BOM-SFO-U' -> ['MAA-BOM', 'BOM-SFO']
         """
         if self.is_empty_value(sector):
             return []
         
         sector_str = str(sector).strip()
         
-        # Split by '/' to get individual sectors
+        # Check if current file is an FCM file
+        if self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
+            # Use FCM parser for sector splitting
+            return parse_fcm_sector(sector_str)
+        
+        # Standard parsing: Split by '/' to get individual sectors
         if '/' in sector_str:
             sectors = [s.strip() for s in sector_str.split('/') if s.strip()]
             return sectors
@@ -444,6 +484,186 @@ class DataEnricher:
         # Return first and last airport
         return f"{airports[0]}-{airports[-1]}"
     
+    def get_first_last_sector_from_multi(self, sector: str) -> Optional[str]:
+        """
+        Get the first-last airport pattern from a multi-sector route.
+        This extracts the first airport from the first segment and the last airport from the last segment.
+        Works with both standard '/' delimited sectors and FCM format.
+        
+        Examples:
+            Standard: 'HYD-BLR/BLR-PNQ' -> 'HYD-PNQ' (first of first segment + last of last segment)
+            Standard: 'MAA-HYD/HYD-BLR/BLR-DEL' -> 'MAA-DEL' (first of first + last of last)
+            FCM: 'CJB-MAA-Q-MAA-CMB-Q' -> 'CJB-CMB' (first airport + last airport)
+            Single: 'MAA-HYD' -> None (single sector, not applicable)
+            Complex: 'HYD-BLR-CCU/CCU-PNQ-DEL' -> 'HYD-DEL' (first of 'HYD-BLR-CCU' + last of 'CCU-PNQ-DEL')
+        
+        Returns None if sector is invalid, is a single sector, or cannot extract airports.
+        """
+        if self.is_empty_value(sector):
+            return None
+        
+        sector_str = str(sector).strip()
+        
+        # Split using the appropriate method (handles both standard and FCM formats)
+        sectors = self.split_multi_sector(sector_str)
+        
+        # Need at least 2 sectors for first-last pattern
+        if not sectors or len(sectors) < 2:
+            return None
+        
+        # Get first sector and extract first airport
+        first_sector = sectors[0]
+        first_airports = first_sector.split('-')
+        if len(first_airports) < 2:
+            return None
+        first_airport = first_airports[0].strip()
+        
+        # Get last sector and extract last airport
+        last_sector = sectors[-1]
+        last_airports = last_sector.split('-')
+        if len(last_airports) < 2:
+            return None
+        last_airport = last_airports[-1].strip()
+        
+        # Return combined first-last pattern
+        if first_airport and last_airport:
+            return f"{first_airport}-{last_airport}"
+        
+        return None
+    
+    def combine_consecutive_sectors(self, sectors: List[str]) -> Optional[str]:
+        """
+        Combine consecutive sectors into a single first-last pattern.
+        Takes the first airport of the first sector and last airport of the last sector.
+        Examples:
+            ['PNQ-HYD', 'HYD-CJB'] -> 'PNQ-CJB'
+            ['IXJ-AMD', 'AMD-PNQ'] -> 'IXJ-PNQ'
+        Returns None if invalid or cannot extract airports.
+        """
+        if not sectors or len(sectors) < 1:
+            return None
+        
+        # Get first airport from first sector
+        first_sector = sectors[0]
+        first_airports = first_sector.split('-')
+        if len(first_airports) < 2:
+            return None
+        first_airport = first_airports[0].strip()
+        
+        # Get last airport from last sector
+        last_sector = sectors[-1]
+        last_airports = last_sector.split('-')
+        if len(last_airports) < 2:
+            return None
+        last_airport = last_airports[-1].strip()
+        
+        if first_airport and last_airport:
+            return f"{first_airport}-{last_airport}"
+        
+        return None
+    
+    def get_all_sector_combinations(self, sector: str) -> List[str]:
+        """
+        Get all possible sector combinations for matching, including:
+        1. Individual sectors (split by '/')
+        2. Paired combinations based on number of segments
+        3. First-last sector combination
+        
+        Examples:
+            'PNQ-HYD/HYD-CJB/CJB-PNQ' (3 segments, 2 '/'):
+                - Individual: ['PNQ-HYD', 'HYD-CJB', 'CJB-PNQ']
+                - Pairs: ['PNQ-CJB' (segments 0-1), 'HYD-PNQ' (segments 1-2)]
+                - First-last: ['PNQ-PNQ']
+            
+            'IXJ-AMD/AMD-PNQ/PNQ-DEL/DEL-IXJ' (4 segments, 3 '/'):
+                - Individual: ['IXJ-AMD', 'AMD-PNQ', 'PNQ-DEL', 'DEL-IXJ']
+                - Half splits: ['IXJ-PNQ' (segments 0-1), 'PNQ-IXJ' (segments 2-3)]
+                - First-last: ['IXJ-IXJ']
+            
+            'A-B/B-C/C-D/D-E/E-F/F-G' (6 segments, 5 '/'):
+                - Individual: ['A-B', 'B-C', 'C-D', 'D-E', 'E-F', 'F-G']
+                - Consecutive pairs: ['A-C', 'B-D', 'C-E', 'D-F', 'E-G']
+                - Half splits: ['A-D' (first half), 'D-G' (second half)]
+                - First-last: ['A-G']
+        
+        Works dynamically for any number of segments!
+        
+        Returns list of unique sector patterns to query.
+        """
+        if self.is_empty_value(sector):
+            return []
+        
+        sector_str = str(sector).strip()
+        all_combinations = []
+        
+        # Split to get individual sectors (handles both standard '/' and FCM format)
+        sectors = self.split_multi_sector(sector_str)
+        
+        # If only one sector after splitting, return as-is
+        if len(sectors) <= 1:
+            return sectors
+        
+        # Add all individual sectors
+        all_combinations.extend(sectors)
+        
+        num_sectors = len(sectors)
+        
+        # Handle different numbers of segments
+        if num_sectors == 2:
+            # 2 segments (1 '/'): already have individuals + will add first-last below
+            pass
+        
+        elif num_sectors == 3:
+            # 3 segments (2 '/'): Add paired combinations
+            # Pair 1: segments 0-1 (first two)
+            pair1 = self.combine_consecutive_sectors(sectors[0:2])
+            if pair1 and pair1 not in all_combinations:
+                all_combinations.append(pair1)
+            
+            # Pair 2: segments 1-2 (last two)
+            pair2 = self.combine_consecutive_sectors(sectors[1:3])
+            if pair2 and pair2 not in all_combinations:
+                all_combinations.append(pair2)
+        
+        elif num_sectors == 4:
+            # 4 segments (3 '/'): Split in half
+            # First half: segments 0-1
+            first_half = self.combine_consecutive_sectors(sectors[0:2])
+            if first_half and first_half not in all_combinations:
+                all_combinations.append(first_half)
+            
+            # Second half: segments 2-3
+            second_half = self.combine_consecutive_sectors(sectors[2:4])
+            if second_half and second_half not in all_combinations:
+                all_combinations.append(second_half)
+        
+        elif num_sectors > 4:
+            # For more than 4 segments: Add consecutive pairs
+            for i in range(len(sectors) - 1):
+                pair = self.combine_consecutive_sectors(sectors[i:i+2])
+                if pair and pair not in all_combinations:
+                    all_combinations.append(pair)
+            
+            # For even number of segments, also split in half
+            if num_sectors % 2 == 0:
+                mid_point = num_sectors // 2
+                # First half
+                first_half = self.combine_consecutive_sectors(sectors[0:mid_point])
+                if first_half and first_half not in all_combinations:
+                    all_combinations.append(first_half)
+                
+                # Second half
+                second_half = self.combine_consecutive_sectors(sectors[mid_point:num_sectors])
+                if second_half and second_half not in all_combinations:
+                    all_combinations.append(second_half)
+        
+        # Always add first-last sector combination
+        first_last = self.get_first_last_sector_from_multi(sector_str)
+        if first_last and first_last not in all_combinations:
+            all_combinations.append(first_last)
+        
+        return all_combinations
+    
     def detect_reference_columns(self, df_excel: pd.DataFrame, 
                                 possible_combinations: List[List[str]]) -> List[str]:
         """
@@ -458,6 +678,34 @@ class DataEnricher:
         
         logger.error("No suitable reference columns found")
         return []
+    
+    def get_fcm_ticket_variations(self, ticket_value: str) -> List[str]:
+        """
+        Get all ticket number variations for FCM files.
+        For non-FCM files or empty values, returns the original value in a list.
+        
+        For FCM files, generates variations with prefixes:
+        607, 098, 176, 125, 057, 074, 157, 220
+        
+        Each prefix is tried both with and without a dash separator.
+        
+        Args:
+            ticket_value: Original ticket number value
+            
+        Returns:
+            List of ticket number variations to try. First item is always the original value.
+            
+        Example (for FCM files):
+            get_fcm_ticket_variations('2790431640') returns:
+            ['2790431640', '6072790431640', '607-2790431640', '0982790431640', ...]
+        """
+        # Check if current file is an FCM file
+        if self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
+            # Use FCM parser to generate variations
+            return generate_fcm_ticket_variations(ticket_value)
+        
+        # For non-FCM files, return original value only
+        return [ticket_value]
     
     def create_dynamic_query(self, reference_columns: List[str], params: List) -> str:
         """
@@ -637,6 +885,7 @@ class DataEnricher:
             ('Airline_Gst_Name', 'Airline_Legal_Name', False),  # From DB
             (None, 'Ticket_Amount', True),  # Excel only: "Total Fare (Including GST)"
             (None, 'Cost_Center', True),  # Excel only: "Cost_Center"
+            (None, 'Remarks', True),  # Excel only: "Remarks"
             ('Invoice_Type', 'Invoice_Type', False),  # From DB
             ('Email_Date', 'Invoice_Received_Date', False),  # From DB
             ('Date_Of_Invoice', 'Invoice_Date', False),  # From DB
@@ -663,7 +912,7 @@ class DataEnricher:
             'Booking_Date': ['Booking Date', 'booking date', 'BookingDate', 'Booking_Date', 'booking_date'],
             'Travel_Date': ['Departure Date', 'departure date', 'DepartureDate', 'Departure_Date', 'departure_date', 'Onward Date', 'onward date', 'OnwardDate', 'Travel_Date', 'travel date'],
             'Passenger_Name': ['LOUIS ARUL AROCKIASAMY', 'louis arul arokiasamy', 'Traveller', 'Traveler_Name', 'traveler name', 'TravelerName', 'Passenger Name', 'passenger name', 'Passenger Name'],
-            'PNR': ['Airline Pnr', 'airline pnr', 'Airline PNR', 'Airline PNR/Prov. Booking', 'airline pnr/prov. booking', 'pnrnumber', 'pnr number', 'PNR_Number', 'PNR', 'pnr'],
+            'PNR': ['Airline Pnr', 'airline pnr', 'Airlne Pnr', 'airlne pnr', 'Airline PNR', 'Airline PNR/Prov. Booking', 'airline pnr/prov. booking', 'pnrnumber', 'pnr number', 'PNR_Number', 'PNR', 'pnr'],
             'Ticket_Number': ['Airline Ticket No.', 'airline ticket no.', 'Airline Ticket No', 'Ticket Num/Final Booking', 'ticket num/final booking', 'TicketNumber', 'Ticket Number', 'ticket number', 'Ticket_Number'],
             'Vendor Invoice No': ['GST INVOICE NO', 'gst invoice no', 'GST Invoice No', 'GST_INVOICE_NO', 'GSTInvoiceNo', 'GST Invoice Number', 'Vendor Invoice Number', 'vendor invoice number', 'Vendor Invoice No', 'vendor invoice no', 'Vendor_Invoice_Number', 'vendor_invoice_number'],
             'Vendor K3 Amount': ['TOTAL K3', 'total k3', 'Total K3', 'TOTAL_K3', 'TotalK3', 'Total K3 Amount', 'K3', 'k3', 'Vendor K3 Amount', 'vendor k3 amount', 'Vendor_K3_Amount', 'vendor_k3_amount'],
@@ -671,9 +920,15 @@ class DataEnricher:
             'Airline_Code': ['Airline Code', 'airline code', 'AirlineCode', 'airlinecode', 'Airline_Code'],
             'Travel_Mode': ['TRIP TYPE', 'trip type', 'Trip Type', 'TRIP_TYPE', 'TripType', 'Product Type', 'product type', 'ProductType', 'Travel_Mode', 'travel mode'],
             'Travel_Sector': ['Sector', 'sector', 'Travel_Sector', 'travel sector', 'TravelSector', 'trvael sector', 'travelsector'],
-            'Ticket_Amount': ['Total Fare (Including GST)', 'total fare (including gst)', 'Total Fare', 'total fare', 'TotalFare', 'Total_Fare'],
-            'Cost_Center': ['Cost_Center', 'cost center', 'CostCenter', 'Cost Centre', 'cost centre', 'Cost Center']
+            'Ticket_Amount': ['Total Fare (Including GST)', 'total fare (including gst)', 'Total Fare', 'total fare', 'TotalFare', 'Total_Fare', 'Gross Fare', 'gross fare', 'GrossFare', 'Gross_Fare', 'gross_fare'],
+            'Cost_Center': ['Cost_Center', 'cost center', 'CostCenter', 'Cost Centre', 'cost centre', 'Cost Center'],
+            'Remarks': ['Remarks', 'remarks', 'REMARKS', 'Remark', 'remark', 'REMARK', 'Comments', 'comments', 'COMMENTS']
         }
+        
+        # For FCM files, prioritize "Gross Fare" for Ticket_Amount
+        if self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
+            excel_column_mappings['Ticket_Amount'] = ['Gross Fare', 'gross fare', 'GrossFare', 'Gross_Fare', 'gross_fare', 'Total Fare (Including GST)', 'total fare (including gst)', 'Total Fare', 'total fare', 'TotalFare', 'Total_Fare']
+            logger.info("FCM file detected: Prioritizing 'Gross Fare' for Ticket_Amount")
         
         # Extract DB columns to fetch (exclude Excel-only columns)
         db_columns_to_fetch = [col[0] for col in output_column_mapping if col[0] is not None and not col[2]]
@@ -761,19 +1016,21 @@ class DataEnricher:
                     if has_sector and sector_excel_col and sector_excel_col in row.index:
                         sector_value = row[sector_excel_col]
                     
-                    # Split multi-sector routes by '/' and query each sector separately
+                    # Get all sector combinations including individuals, pairs, and first-last
                     sectors_to_query = []
                     if has_sector and sector_value and not self.is_empty_value(sector_value):
-                        sectors_to_query = self.split_multi_sector(sector_value)  # Split by '/' to get individual sectors
+                        sectors_to_query = self.get_all_sector_combinations(sector_value)
                     else:
                         sectors_to_query = [None]  # Single query without sector
                     
                     # Build keys for each sector
                     for sector in sectors_to_query:
-                        key_values = []
+                        # Collect base values for all columns
+                        base_values = []
                         valid_for_sector = True
+                        ticket_index = None  # Track position of Ticket_Number in the combination
                         
-                        for ref_col in combination:
+                        for col_idx, ref_col in enumerate(combination):
                             # Find the Excel column name that maps to this DB column
                             excel_col = None
                             for excel_name, db_name in excel_to_db_mapping.items():
@@ -805,14 +1062,31 @@ class DataEnricher:
                             if ref_col == 'Travel_Sector' and sector is not None:
                                 value = sector
                             
+                            # Normalize PNR/Ticket values for FCM files
+                            if ref_col in ['PNR_Number', 'Ticket_Number']:
+                                value = self.normalize_pnr_ticket_value(value, ref_col)
+                                # Track if this is Ticket_Number for FCM variation handling
+                                if ref_col == 'Ticket_Number':
+                                    ticket_index = col_idx
+                            
                             if self.is_empty_value(value):
                                 valid_for_sector = False
                                 break
                             
-                            key_values.append(value)
+                            base_values.append(value)
                         
                         if valid_for_sector:
-                            key_values_list.append(tuple(key_values))
+                            # For FCM files with Ticket_Number, generate variations
+                            if ticket_index is not None and self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
+                                ticket_variations = self.get_fcm_ticket_variations(base_values[ticket_index])
+                                # Create a key for each ticket variation
+                                for ticket_var in ticket_variations:
+                                    varied_values = base_values.copy()
+                                    varied_values[ticket_index] = ticket_var
+                                    key_values_list.append(tuple(varied_values))
+                            else:
+                                # Non-FCM or no Ticket_Number: use single key
+                                key_values_list.append(tuple(base_values))
                     
                     if key_values_list:
                         row_keys[idx] = key_values_list
@@ -944,39 +1218,10 @@ class DataEnricher:
                                     all_results.append(lookup[key])
                             
                             if all_results:
-                                # Aggregate numeric columns across all sectors
-                                for col in missing_columns:
-                                    if col in numeric_columns_to_aggregate:
-                                        # Sum numeric values from all sectors
-                                        total = 0
-                                        for result in all_results:
-                                            val = result.get(col)
-                                            if val is not None:
-                                                try:
-                                                    total += float(val)
-                                                except (ValueError, TypeError):
-                                                    pass
-                                        aggregated_data[col] = total if total != 0 else None
-                                    elif col == 'Public_File_URL':
-                                        # Special handling: Collect all Public_File_URL values separated by comma
-                                        url_list = []
-                                        for result in all_results:
-                                            val = result.get('Public_File_URL')
-                                            if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
-                                                url_list.append(str(val).strip())
-                                        aggregated_data[col] = ', '.join(url_list) if url_list else None
-                                    else:
-                                        # For non-numeric columns, take first non-null value
-                                        for result in all_results:
-                                            val = result.get(col)
-                                            if val is not None:
-                                                aggregated_data[col] = val
-                                                break
-                                        if col not in aggregated_data:
-                                            aggregated_data[col] = None
-                                
+                                # Store all matching results as separate entries
+                                # Each result will create a separate output row
                                 row_matches[idx] = {
-                                    'matched_data': aggregated_data,
+                                    'matched_data_list': all_results,  # List of all matching records
                                     'combination': combination
                                 }
                                 unmatched_indices.remove(idx)
@@ -1172,39 +1417,10 @@ class DataEnricher:
                                         all_results_fallback.append(lookup_fallback[key])
                                 
                                 if all_results_fallback:
-                                    # Aggregate numeric columns
-                                    aggregated_data_fallback = {}
-                                    for col in missing_columns:
-                                        if col in numeric_columns_to_aggregate:
-                                            total = 0
-                                            for result in all_results_fallback:
-                                                val = result.get(col)
-                                                if val is not None:
-                                                    try:
-                                                        total += float(val)
-                                                    except (ValueError, TypeError):
-                                                        pass
-                                            aggregated_data_fallback[col] = total if total != 0 else None
-                                        elif col == 'Public_File_URL':
-                                            # Special handling: Collect all Public_File_URL values separated by comma
-                                            url_list = []
-                                            for result in all_results_fallback:
-                                                val = result.get('Public_File_URL')
-                                                if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
-                                                    url_list.append(str(val).strip())
-                                            aggregated_data_fallback[col] = ', '.join(url_list) if url_list else None
-                                        else:
-                                            # For non-numeric columns, take first non-null value
-                                            for result in all_results_fallback:
-                                                val = result.get(col)
-                                                if val is not None:
-                                                    aggregated_data_fallback[col] = val
-                                                    break
-                                            if col not in aggregated_data_fallback:
-                                                aggregated_data_fallback[col] = None
-                                    
+                                    # Store all matching results as separate entries
+                                    # Each result will create a separate output row
                                     row_matches[idx] = {
-                                        'matched_data': aggregated_data_fallback,
+                                        'matched_data_list': all_results_fallback,  # List of all matching records
                                         'combination': combination
                                     }
                                     unmatched_indices.remove(idx)
@@ -1255,6 +1471,8 @@ class DataEnricher:
                             continue
                         
                         ticket_value = row[ticket_excel_col]
+                        # Normalize ticket value for FCM files
+                        ticket_value = self.normalize_pnr_ticket_value(ticket_value, 'Ticket_Number')
                         if self.is_empty_value(ticket_value):
                             continue
                         
@@ -1266,14 +1484,20 @@ class DataEnricher:
                         if self.is_empty_value(sector_value):
                             continue
                         
-                        # Split multi-sector routes by '/' and query each sector separately
-                        sectors_to_query_ticket = self.split_multi_sector(sector_value)  # Split by '/' to get individual sectors
+                        # Get all sector combinations including individuals, pairs, and first-last
+                        sectors_to_query_ticket = self.get_all_sector_combinations(sector_value)
                         
                         # Build keys for each sector using Ticket_Number as PNR_Number
+                        # For FCM files, also try with prefix variations
                         key_values_list_ticket = []
+                        
+                        # Get ticket variations (for FCM files, returns multiple; for others, returns original only)
+                        ticket_variations = self.get_fcm_ticket_variations(ticket_value)
+                        
                         for sector in sectors_to_query_ticket:
-                            key_values_ticket = [ticket_value, sector]  # [PNR_Number, Travel_Sector]
-                            key_values_list_ticket.append(tuple(key_values_ticket))
+                            for ticket_var in ticket_variations:
+                                key_values_ticket = [ticket_var, sector]  # [PNR_Number, Travel_Sector]
+                                key_values_list_ticket.append(tuple(key_values_ticket))
                         
                         if key_values_list_ticket:
                             row_keys_ticket_as_pnr[idx] = key_values_list_ticket
@@ -1391,39 +1615,10 @@ class DataEnricher:
                                         all_results_ticket.append(lookup_ticket_as_pnr[key])
                                 
                                 if all_results_ticket:
-                                    # Aggregate numeric columns
-                                    aggregated_data_ticket = {}
-                                    for col in missing_columns:
-                                        if col in numeric_columns_to_aggregate:
-                                            total = 0
-                                            for result in all_results_ticket:
-                                                val = result.get(col)
-                                                if val is not None:
-                                                    try:
-                                                        total += float(val)
-                                                    except (ValueError, TypeError):
-                                                        pass
-                                            aggregated_data_ticket[col] = total if total != 0 else None
-                                        elif col == 'Public_File_URL':
-                                            # Special handling: Collect all Public_File_URL values separated by comma
-                                            url_list = []
-                                            for result in all_results_ticket:
-                                                val = result.get('Public_File_URL')
-                                                if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
-                                                    url_list.append(str(val).strip())
-                                            aggregated_data_ticket[col] = ', '.join(url_list) if url_list else None
-                                        else:
-                                            # For non-numeric columns, take first non-null value
-                                            for result in all_results_ticket:
-                                                val = result.get(col)
-                                                if val is not None:
-                                                    aggregated_data_ticket[col] = val
-                                                    break
-                                            if col not in aggregated_data_ticket:
-                                                aggregated_data_ticket[col] = None
-                                    
+                                    # Store all matching results as separate entries
+                                    # Each result will create a separate output row
                                     row_matches[idx] = {
-                                        'matched_data': aggregated_data_ticket,
+                                        'matched_data_list': all_results_ticket,  # List of all matching records
                                         'combination': ['PNR_Number', 'Travel_Sector']  # Mark as PNR_Number match
                                     }
                                     unmatched_indices.remove(idx)
@@ -1436,66 +1631,104 @@ class DataEnricher:
                 idx = batch_df.index[pos]
                 row_data = batch_df.iloc[pos].to_dict()
                 
-                # Create a new row dict with all required columns
-                complete_row = {}
-                
                 # Get matched data from database (if row was matched)
-                matched_db_data = {}
                 if idx in row_matches:
                     match_info = row_matches[idx]
-                    matched_db_data = match_info['matched_data']
-                    match_count += 1
+                    matched_data_list = match_info.get('matched_data_list', [])
+                    
+                    # Create a separate output row for each matching database record
+                    for row_index, matched_db_data in enumerate(matched_data_list):
+                        # Create a new row dict with all required columns
+                        complete_row = {}
+                        
+                        # Process each column according to output_column_mapping
+                        for db_col, output_col, excel_only in output_column_mapping:
+                            if excel_only:
+                                # Skip Passenger_Name for duplicate rows (only include in first row)
+                                if output_col == 'Passenger_Name' and row_index > 0:
+                                    complete_row[output_col] = None
+                                    continue
+                                
+                                # Excel-only columns: only take from Excel if column exists
+                                excel_col_found = None
+                                excel_names = excel_column_mappings.get(output_col, [])
+                                for excel_name in excel_names:
+                                    matched_col = self.find_column_case_insensitive(excel_name, list(df_excel.columns))
+                                    if matched_col:
+                                        excel_col_found = matched_col
+                                        break
+                                
+                                if excel_col_found and excel_col_found in row_data:
+                                    # For Excel-only columns, use output_col as the key directly
+                                    value = row_data[excel_col_found]
+                                    
+                                    # Apply date conversion for date columns
+                                    if output_col in ['Booking_Date', 'Travel_Date']:
+                                        value = self.convert_excel_date(value)
+                                    
+                                    complete_row[output_col] = value
+                                else:
+                                    complete_row[output_col] = None
+                            else:
+                                # DB columns: always fetch from DB (even if exists in Excel)
+                                # Use matched data from database
+                                complete_row[db_col] = matched_db_data.get(db_col)
+                        
+                        # Check if Total Fare (Including GST) from Excel differs from Invoice_Total from DB
+                        # If different, recalculate Invoice_Total as sum of Taxable_Amount + NonTaxable_Amount + Invoice_Total_GST
+                        ticket_amount_value = complete_row.get('Ticket_Amount')
+                        invoice_total_value = complete_row.get('Invoice_Total')
+                        
+                        if ticket_amount_value is not None and invoice_total_value is not None:
+                            try:
+                                excel_amount = float(ticket_amount_value)
+                                db_amount = float(invoice_total_value)
+                                
+                                # If amounts don't match, recalculate
+                                if abs(excel_amount - db_amount) > 0.01:  # Allow small tolerance for float comparison
+                                    taxable = float(complete_row.get('Taxable_Amount') or 0)
+                                    non_taxable = float(complete_row.get('NonTaxable_Amount') or 0)
+                                    total_gst = float(complete_row.get('Invoice_Total_GST') or 0)
+                                    complete_row['Invoice_Total'] = taxable + non_taxable + total_gst
+                            except (ValueError, TypeError):
+                                pass  # Keep original value if conversion fails
+                        
+                        enriched_data.append(complete_row)
+                    
+                    match_count += len(matched_data_list)  # Count each database record as a match
                 else:
-                    no_match_count += 1
-                
-                # Process each column according to output_column_mapping
-                for db_col, output_col, excel_only in output_column_mapping:
-                    if excel_only:
-                        # Excel-only columns: only take from Excel if column exists
-                        excel_col_found = None
-                        excel_names = excel_column_mappings.get(output_col, [])
-                        for excel_name in excel_names:
-                            matched_col = self.find_column_case_insensitive(excel_name, list(df_excel.columns))
-                            if matched_col:
-                                excel_col_found = matched_col
-                                break
-                        
-                        if excel_col_found and excel_col_found in row_data:
-                            # For Excel-only columns, use output_col as the key directly
-                            value = row_data[excel_col_found]
+                    # No match found - create row with only Excel data
+                    complete_row = {}
+                    
+                    # Process each column according to output_column_mapping
+                    for db_col, output_col, excel_only in output_column_mapping:
+                        if excel_only:
+                            # Excel-only columns: only take from Excel if column exists
+                            excel_col_found = None
+                            excel_names = excel_column_mappings.get(output_col, [])
+                            for excel_name in excel_names:
+                                matched_col = self.find_column_case_insensitive(excel_name, list(df_excel.columns))
+                                if matched_col:
+                                    excel_col_found = matched_col
+                                    break
                             
-                            # Apply date conversion for date columns
-                            if output_col in ['Booking_Date', 'Travel_Date']:
-                                value = self.convert_excel_date(value)
-                            
-                            complete_row[output_col] = value
+                            if excel_col_found and excel_col_found in row_data:
+                                # For Excel-only columns, use output_col as the key directly
+                                value = row_data[excel_col_found]
+                                
+                                # Apply date conversion for date columns
+                                if output_col in ['Booking_Date', 'Travel_Date']:
+                                    value = self.convert_excel_date(value)
+                                
+                                complete_row[output_col] = value
+                            else:
+                                complete_row[output_col] = None
                         else:
-                            complete_row[output_col] = None
-                    else:
-                        # DB columns: always fetch from DB (even if exists in Excel)
-                        # Use matched data from database
-                        complete_row[db_col] = matched_db_data.get(db_col)
-                
-                # Check if Total Fare (Including GST) from Excel differs from Invoice_Total from DB
-                # If different, recalculate Invoice_Total as sum of Taxable_Amount + NonTaxable_Amount + Invoice_Total_GST
-                ticket_amount_value = complete_row.get('Ticket_Amount')
-                invoice_total_value = complete_row.get('Invoice_Total')
-                
-                if ticket_amount_value is not None and invoice_total_value is not None:
-                    try:
-                        excel_amount = float(ticket_amount_value)
-                        db_amount = float(invoice_total_value)
-                        
-                        # If amounts don't match, recalculate
-                        if abs(excel_amount - db_amount) > 0.01:  # Allow small tolerance for float comparison
-                            taxable = float(complete_row.get('Taxable_Amount') or 0)
-                            non_taxable = float(complete_row.get('NonTaxable_Amount') or 0)
-                            total_gst = float(complete_row.get('Invoice_Total_GST') or 0)
-                            complete_row['Invoice_Total'] = taxable + non_taxable + total_gst
-                    except (ValueError, TypeError):
-                        pass  # Keep original value if conversion fails
-                
-                enriched_data.append(complete_row)
+                            # DB columns: no match, so set to None
+                            complete_row[db_col] = None
+                    
+                    enriched_data.append(complete_row)
+                    no_match_count += 1
         
         # Log combination usage statistics
         logger.info("Combination usage statistics:")
@@ -1552,6 +1785,9 @@ class DataEnricher:
         Enhanced data enrichment with dynamic column detection and batch processing.
         Returns either pd.DataFrame (single sheet) or Dict[str, pd.DataFrame] (multiple sheets).
         """
+        # Store current file path for FCM detection
+        self.current_file_path = excel_path
+        
         if column_mapping is None:
             column_mapping = {}
         if possible_reference_combinations is None:
