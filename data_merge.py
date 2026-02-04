@@ -22,10 +22,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from data_splitter import split_by_vendor_k3_amount
+from data_splitter import split_to_sheets
 from invoice_deduplicator import process_multiple_files
 from gstr_2b_3b_merger import merge_gstr_data
-from fcm_parser import is_fcm_file, parse_fcm_sector, parse_fcm_pnr_or_ticket, generate_fcm_ticket_variations
+from fcm_parser import is_fcm_file, parse_fcm_sector, parse_fcm_pnr_or_ticket, generate_fcm_ticket_variations, expand_slash_notation_ticket
 from booking_date_normalizer import normalize_excel_booking_date, normalize_db_booking_date
 
 # Configure enhanced logging for automated execution
@@ -685,6 +685,7 @@ class DataEnricher:
         Get all ticket number variations.
         
         For all files:
+        - Handles slash notation: '2791140688/89' -> ['2791140688', '2791140689']
         - If ticket number length > 10, includes both original and version with dash
           at position (length-10). Example: '1252791614965' -> ['1252791614965', '125-2791614965']
         
@@ -694,7 +695,7 @@ class DataEnricher:
         Each prefix is tried both with and without a dash separator.
         
         Args:
-            ticket_value: Original ticket number value
+            ticket_value: Original ticket number value (may contain slash notation)
             
         Returns:
             List of ticket number variations to try. First item is always the original value.
@@ -705,13 +706,16 @@ class DataEnricher:
         Example (for non-FCM files with long ticket):
             get_fcm_ticket_variations('1252791614965') returns:
             ['1252791614965', '125-2791614965']
+        Example (with slash notation):
+            get_fcm_ticket_variations('2791140688/89') returns:
+            ['2791140688', '2791140689', ...] (plus prefix variations for FCM files)
         """
         # Check if current file is an FCM file
         if self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
-            # Use FCM parser to generate variations (includes dash logic for length > 10)
+            # Use FCM parser to generate variations (includes slash expansion, dash logic, and prefixes)
             return generate_fcm_ticket_variations(ticket_value)
         
-        # For non-FCM files, apply dash logic for long ticket numbers
+        # For non-FCM files, apply slash expansion and dash logic for long ticket numbers
         if not ticket_value or not isinstance(ticket_value, str):
             return [str(ticket_value) if ticket_value else '']
         
@@ -719,15 +723,27 @@ class DataEnricher:
         if not ticket_value:
             return ['']
         
-        variations = [ticket_value]
+        # First, expand slash notation (e.g., '2791140688/89' -> ['2791140688', '2791140689'])
+        base_tickets = expand_slash_notation_ticket(ticket_value)
         
-        # If ticket number length > 10, add version with dash at position (length-10)
-        if len(ticket_value) > 10:
-            dash_position = len(ticket_value) - 10
-            ticket_with_dash = f"{ticket_value[:dash_position]}-{ticket_value[dash_position:]}"
-            variations.append(ticket_with_dash)
+        all_variations = []
+        seen = set()
         
-        return variations
+        for base_ticket in base_tickets:
+            if not base_ticket or base_ticket in seen:
+                continue
+            seen.add(base_ticket)
+            all_variations.append(base_ticket)
+            
+            # If ticket number length > 10, add version with dash at position (length-10)
+            if len(base_ticket) > 10 and '-' not in base_ticket:
+                dash_position = len(base_ticket) - 10
+                ticket_with_dash = f"{base_ticket[:dash_position]}-{base_ticket[dash_position:]}"
+                if ticket_with_dash not in seen:
+                    seen.add(ticket_with_dash)
+                    all_variations.append(ticket_with_dash)
+        
+        return all_variations
     
     def create_dynamic_query(self, reference_columns: List[str], params: List) -> str:
         """
@@ -2262,32 +2278,24 @@ class DataEnricher:
                         except Exception as gstr_error:
                             logger.warning(f"Could not merge GSTR data: {gstr_error}")
                         
-                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
+                        # Split data into Invoice, Credit_Note, and Zero sheets in a single file
                         try:
-                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
-                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
-                                output_path,
-                                output_directory=os.path.dirname(output_path)
-                            )
-                            if credit_note_path:
-                                logger.info(f"Credit note file created: {credit_note_path}")
-                            if invoice_path:
-                                logger.info(f"Invoice file created: {invoice_path}")
-                            if zero_path:
-                                logger.info(f"Zero file created: {zero_path}")
-                            
-                            # Process duplicate invoice numbers in each split file
-                            try:
-                                logger.info("Processing duplicate invoice numbers in split files...")
-                                processed_files = process_multiple_files(
-                                    [credit_note_path, invoice_path, zero_path],
-                                    invoice_number_column='Invoice_Number'
-                                )
-                                logger.info("Completed processing duplicate invoice numbers")
-                            except Exception as dedup_error:
-                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
+                            logger.info("Splitting data into Invoice, Credit_Note, and Zero sheets...")
+                            split_output_path = split_to_sheets(output_path)
+                            if split_output_path:
+                                logger.info(f"Data split into sheets: {split_output_path}")
+                                # Process duplicate invoice numbers in each sheet
+                                try:
+                                    logger.info("Processing duplicate invoice numbers in sheets...")
+                                    processed_files = process_multiple_files(
+                                        [split_output_path],
+                                        invoice_number_column='Invoice_Number'
+                                    )
+                                    logger.info("Completed processing duplicate invoice numbers")
+                                except Exception as dedup_error:
+                                    logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
+                            logger.warning(f"Could not split data into sheets: {split_error}")
                     else:
                         # Save each sheet separately in Excel
                         with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
@@ -2323,32 +2331,24 @@ class DataEnricher:
                         except Exception as gstr_error:
                             logger.warning(f"Could not merge GSTR data: {gstr_error}")
                         
-                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
+                        # Split data into Invoice, Credit_Note, and Zero sheets in a single file
                         try:
-                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
-                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
-                                output_path,
-                                output_directory=os.path.dirname(output_path)
-                            )
-                            if credit_note_path:
-                                logger.info(f"Credit note file created: {credit_note_path}")
-                            if invoice_path:
-                                logger.info(f"Invoice file created: {invoice_path}")
-                            if zero_path:
-                                logger.info(f"Zero file created: {zero_path}")
-                            
-                            # Process duplicate invoice numbers in each split file
-                            try:
-                                logger.info("Processing duplicate invoice numbers in split files...")
-                                processed_files = process_multiple_files(
-                                    [credit_note_path, invoice_path, zero_path],
-                                    invoice_number_column='Invoice_Number'
-                                )
-                                logger.info("Completed processing duplicate invoice numbers")
-                            except Exception as dedup_error:
-                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
+                            logger.info("Splitting data into Invoice, Credit_Note, and Zero sheets...")
+                            split_output_path = split_to_sheets(output_path)
+                            if split_output_path:
+                                logger.info(f"Data split into sheets: {split_output_path}")
+                                # Process duplicate invoice numbers in each sheet
+                                try:
+                                    logger.info("Processing duplicate invoice numbers in sheets...")
+                                    processed_files = process_multiple_files(
+                                        [split_output_path],
+                                        invoice_number_column='Invoice_Number'
+                                    )
+                                    logger.info("Completed processing duplicate invoice numbers")
+                                except Exception as dedup_error:
+                                    logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
+                            logger.warning(f"Could not split data into sheets: {split_error}")
                 except Exception as e:
                     logger.error(f"Error saving file: {e}")
             
@@ -2378,32 +2378,24 @@ class DataEnricher:
                         except Exception as gstr_error:
                             logger.warning(f"Could not merge GSTR data: {gstr_error}")
                         
-                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
+                        # Split data into Invoice, Credit_Note, and Zero sheets in a single file
                         try:
-                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
-                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
-                                output_path,
-                                output_directory=os.path.dirname(output_path)
-                            )
-                            if credit_note_path:
-                                logger.info(f"Credit note file created: {credit_note_path}")
-                            if invoice_path:
-                                logger.info(f"Invoice file created: {invoice_path}")
-                            if zero_path:
-                                logger.info(f"Zero file created: {zero_path}")
-                            
-                            # Process duplicate invoice numbers in each split file
-                            try:
-                                logger.info("Processing duplicate invoice numbers in split files...")
-                                processed_files = process_multiple_files(
-                                    [credit_note_path, invoice_path, zero_path],
-                                    invoice_number_column='Invoice_Number'
-                                )
-                                logger.info("Completed processing duplicate invoice numbers")
-                            except Exception as dedup_error:
-                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
+                            logger.info("Splitting data into Invoice, Credit_Note, and Zero sheets...")
+                            split_output_path = split_to_sheets(output_path)
+                            if split_output_path:
+                                logger.info(f"Data split into sheets: {split_output_path}")
+                                # Process duplicate invoice numbers in each sheet
+                                try:
+                                    logger.info("Processing duplicate invoice numbers in sheets...")
+                                    processed_files = process_multiple_files(
+                                        [split_output_path],
+                                        invoice_number_column='Invoice_Number'
+                                    )
+                                    logger.info("Completed processing duplicate invoice numbers")
+                                except Exception as dedup_error:
+                                    logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
+                            logger.warning(f"Could not split data into sheets: {split_error}")
                     else:
                         df_enriched.to_excel(output_path, index=False, engine='xlsxwriter')
                         logger.info(f"Data saved to: {output_path}")
@@ -2429,32 +2421,24 @@ class DataEnricher:
                         except Exception as date_format_error:
                             logger.warning(f"Could not apply date formatting: {date_format_error}")
                         
-                        # Split data into credit_note, Invoice, and zero files based on Vendor K3 Amount
+                        # Split data into Invoice, Credit_Note, and Zero sheets in a single file
                         try:
-                            logger.info("Splitting data into credit_note, Invoice, and zero files...")
-                            credit_note_path, invoice_path, zero_path = split_by_vendor_k3_amount(
-                                output_path,
-                                output_directory=os.path.dirname(output_path)
-                            )
-                            if credit_note_path:
-                                logger.info(f"Credit note file created: {credit_note_path}")
-                            if invoice_path:
-                                logger.info(f"Invoice file created: {invoice_path}")
-                            if zero_path:
-                                logger.info(f"Zero file created: {zero_path}")
-                            
-                            # Process duplicate invoice numbers in each split file
-                            try:
-                                logger.info("Processing duplicate invoice numbers in split files...")
-                                processed_files = process_multiple_files(
-                                    [credit_note_path, invoice_path, zero_path],
-                                    invoice_number_column='Invoice_Number'
-                                )
-                                logger.info("Completed processing duplicate invoice numbers")
-                            except Exception as dedup_error:
-                                logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
+                            logger.info("Splitting data into Invoice, Credit_Note, and Zero sheets...")
+                            split_output_path = split_to_sheets(output_path)
+                            if split_output_path:
+                                logger.info(f"Data split into sheets: {split_output_path}")
+                                # Process duplicate invoice numbers in each sheet
+                                try:
+                                    logger.info("Processing duplicate invoice numbers in sheets...")
+                                    processed_files = process_multiple_files(
+                                        [split_output_path],
+                                        invoice_number_column='Invoice_Number'
+                                    )
+                                    logger.info("Completed processing duplicate invoice numbers")
+                                except Exception as dedup_error:
+                                    logger.warning(f"Could not process duplicate invoice numbers: {dedup_error}")
                         except Exception as split_error:
-                            logger.warning(f"Could not split data into credit_note, Invoice, and zero files: {split_error}")
+                            logger.warning(f"Could not split data into sheets: {split_error}")
                 except Exception as e:
                     logger.error(f"Error saving file: {e}")
             
