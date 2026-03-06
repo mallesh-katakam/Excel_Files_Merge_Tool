@@ -24,6 +24,7 @@ def process_duplicate_invoice_numbers(
     """
     Process a file to ensure unique Invoice_Number values.
     Duplicate invoice numbers are marked for manual verification and removed.
+    Handles Excel files with multiple sheets.
     
     Args:
         input_file_path: Path to the input file (Excel or CSV)
@@ -46,14 +47,58 @@ def process_duplicate_invoice_numbers(
         
         if file_ext == '.csv':
             df = pd.read_csv(input_file_path)
+            sheets_data = None
         elif file_ext in ['.xlsx', '.xls']:
-            # Read first sheet if multiple sheets exist
-            df = pd.read_excel(input_file_path, sheet_name=0)
+            # Read all sheets
+            sheets_data = pd.read_excel(input_file_path, sheet_name=None)
+            if not sheets_data:
+                logger.warning(f"Input file is empty: {input_file_path}")
+                return None
+            # If single sheet, work with it directly
+            if len(sheets_data) == 1:
+                df = list(sheets_data.values())[0]
+                sheets_data = None
+            else:
+                df = None  # Will process sheets separately
         else:
             logger.error(f"Unsupported file format: {file_ext}")
             return None
         
-        if df.empty:
+        # Process multiple sheets
+        if sheets_data is not None:
+            logger.info(f"Processing {len(sheets_data)} sheets for duplicate invoice numbers")
+            processed_sheets = {}
+            total_duplicate_count = 0
+            
+            for sheet_name, sheet_df in sheets_data.items():
+                if sheet_df.empty:
+                    logger.info(f"Sheet '{sheet_name}' is empty, skipping")
+                    processed_sheets[sheet_name] = sheet_df
+                    continue
+                
+                # Check if Invoice_Number column exists in this sheet
+                if invoice_number_column not in sheet_df.columns:
+                    logger.info(f"Column '{invoice_number_column}' not found in sheet '{sheet_name}', skipping deduplication")
+                    processed_sheets[sheet_name] = sheet_df
+                    continue
+                
+                # Process this sheet
+                processed_df, duplicate_count = _process_sheet_duplicates(sheet_df, invoice_number_column, sheet_name)
+                processed_sheets[sheet_name] = processed_df
+                total_duplicate_count += duplicate_count
+            
+            logger.info(f"Found {total_duplicate_count} total duplicate Invoice_Number(s) across all sheets.")
+            
+            # Save all processed sheets
+            with pd.ExcelWriter(output_file_path, engine='xlsxwriter') as writer:
+                for sheet_name, sheet_df in processed_sheets.items():
+                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            logger.info(f"Processed file saved with {len(processed_sheets)} sheets: {output_file_path}")
+            return output_file_path
+        
+        # Process single sheet/CSV
+        if df is None or df.empty:
             logger.warning(f"Input file is empty: {input_file_path}")
             return None
         
@@ -63,40 +108,8 @@ def process_duplicate_invoice_numbers(
             # If column doesn't exist, just return the file path without processing
             return output_file_path
         
-        # Initialize Need_Manual_Verification column if it doesn't exist
-        if 'Need_Manual_Verification' not in df.columns:
-            df['Need_Manual_Verification'] = 'No'
-        
-        # Convert Invoice_Number to string, handling NaN/None values properly
-        # First, replace NaN/None with empty string, then convert to string
-        df[invoice_number_column] = df[invoice_number_column].fillna('').astype(str)
-        # Replace string representations of empty/None values
-        df[invoice_number_column] = df[invoice_number_column].replace(['nan', 'None', 'NaT', '<NA>'], '')
-        
-        # Find duplicate invoice numbers (excluding empty values)
-        # Keep first occurrence, mark others as duplicates
-        seen_invoice_numbers = set()
-        duplicate_count = 0
-        
-        for idx, row in df.iterrows():
-            invoice_num = row[invoice_number_column]
-            
-            # Skip empty/None values
-            if pd.isna(invoice_num) or invoice_num is None or str(invoice_num).strip() == '':
-                continue
-            
-            invoice_num_str = str(invoice_num).strip()
-            
-            # Check if this invoice number was seen before
-            if invoice_num_str in seen_invoice_numbers:
-                # This is a duplicate - mark for manual verification and remove invoice number
-                df.at[idx, 'Need_Manual_Verification'] = 'Yes'
-                df.at[idx, invoice_number_column] = ''  # Set to empty string
-                duplicate_count += 1
-                logger.debug(f"Found duplicate Invoice_Number '{invoice_num_str}' at row {idx}, marked for manual verification")
-            else:
-                # First occurrence - keep it
-                seen_invoice_numbers.add(invoice_num_str)
+        # Process the dataframe
+        df, duplicate_count = _process_sheet_duplicates(df, invoice_number_column)
         
         logger.info(f"Found {duplicate_count} duplicate Invoice_Number(s). Marked for manual verification and removed.")
         
@@ -112,6 +125,61 @@ def process_duplicate_invoice_numbers(
     except Exception as e:
         logger.error(f"Error processing duplicate invoice numbers from {input_file_path}: {e}")
         return None
+
+
+def _process_sheet_duplicates(
+    df: pd.DataFrame,
+    invoice_number_column: str,
+    sheet_name: str = None
+) -> tuple:
+    """
+    Process a single DataFrame for duplicate invoice numbers.
+    
+    Args:
+        df: DataFrame to process
+        invoice_number_column: Name of the column containing Invoice_Number
+        sheet_name: Optional sheet name for logging
+    
+    Returns:
+        Tuple of (processed DataFrame, duplicate count)
+    """
+    # Initialize Need_Manual_Verification column if it doesn't exist
+    if 'Need_Manual_Verification' not in df.columns:
+        df['Need_Manual_Verification'] = 'No'
+    
+    # Convert Invoice_Number to string, handling NaN/None values properly
+    df[invoice_number_column] = df[invoice_number_column].fillna('').astype(str)
+    df[invoice_number_column] = df[invoice_number_column].replace(['nan', 'None', 'NaT', '<NA>'], '')
+    
+    # Find duplicate invoice numbers (excluding empty values)
+    seen_invoice_numbers = set()
+    duplicate_count = 0
+    
+    for idx, row in df.iterrows():
+        invoice_num = row[invoice_number_column]
+        
+        # Skip empty/None values
+        if pd.isna(invoice_num) or invoice_num is None or str(invoice_num).strip() == '':
+            continue
+        
+        invoice_num_str = str(invoice_num).strip()
+        
+        # Check if this invoice number was seen before
+        if invoice_num_str in seen_invoice_numbers:
+            # This is a duplicate - mark for manual verification and remove invoice number
+            df.at[idx, 'Need_Manual_Verification'] = 'Yes'
+            df.at[idx, invoice_number_column] = ''  # Set to empty string
+            duplicate_count += 1
+            sheet_info = f" in sheet '{sheet_name}'" if sheet_name else ""
+            logger.debug(f"Found duplicate Invoice_Number '{invoice_num_str}' at row {idx}{sheet_info}, marked for manual verification")
+        else:
+            # First occurrence - keep it
+            seen_invoice_numbers.add(invoice_num_str)
+    
+    sheet_info = f" in sheet '{sheet_name}'" if sheet_name else ""
+    logger.info(f"Processed{sheet_info}: {duplicate_count} duplicate(s) found")
+    
+    return df, duplicate_count
 
 
 def process_dataframe_duplicate_invoice_numbers(

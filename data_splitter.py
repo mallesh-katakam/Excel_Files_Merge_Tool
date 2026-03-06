@@ -1,16 +1,16 @@
 """
 Data Splitter Module
-Splits processed data into three files based on Vendor K3 Amount and Ticket_Amount:
+Splits processed data into three sheets in a single Excel file based on Vendor K3 Amount:
 - Invoice: Vendor K3 Amount > 0
-- credit_note: Vendor K3 Amount < 0
-- zero: Vendor K3 Amount == 0
+- Credit_Note: Vendor K3 Amount < 0
+- Zero: Vendor K3 Amount == 0
 Preserves the original data order.
 """
 
 import pandas as pd
 import os
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -227,3 +227,170 @@ def split_dataframe_by_vendor_k3_amount(
         logger.error(f"Error splitting DataFrame: {e}")
         return None, None, None
 
+
+def split_to_sheets(
+    input_file_path: str,
+    output_file_path: Optional[str] = None,
+    vendor_k3_column: str = 'Vendor K3 Amount'
+) -> Optional[str]:
+    """
+    Split data into three sheets in a single Excel file based on Vendor K3 Amount.
+    - Invoice sheet: Vendor K3 Amount > 0
+    - Credit_Note sheet: Vendor K3 Amount < 0
+    - Zero sheet: Vendor K3 Amount == 0
+    
+    Args:
+        input_file_path: Path to the input file (Excel or CSV)
+        output_file_path: Path for output file. If None, replaces input file.
+        vendor_k3_column: Name of the column containing Vendor K3 Amount
+    
+    Returns:
+        Output file path if successful, None if error
+    """
+    try:
+        # Determine output path
+        if output_file_path is None:
+            base_name = Path(input_file_path).stem
+            output_directory = os.path.dirname(input_file_path)
+            output_file_path = os.path.join(output_directory, f"{base_name}.xlsx")
+        
+        file_ext = Path(input_file_path).suffix.lower()
+        
+        # Read the input file
+        logger.info(f"Reading file for splitting into sheets: {input_file_path}")
+        
+        if file_ext == '.csv':
+            df = pd.read_csv(input_file_path)
+        elif file_ext in ['.xlsx', '.xls']:
+            df = pd.read_excel(input_file_path, sheet_name=0)
+        else:
+            logger.error(f"Unsupported file format: {file_ext}")
+            return None
+        
+        if df.empty:
+            logger.warning(f"Input file is empty: {input_file_path}")
+            return None
+        
+        # Check if required column exists
+        if vendor_k3_column not in df.columns:
+            logger.error(f"Column '{vendor_k3_column}' not found in file. Available columns: {list(df.columns)}")
+            return None
+        
+        # Convert column to numeric, handling any non-numeric values
+        df[vendor_k3_column] = pd.to_numeric(df[vendor_k3_column], errors='coerce')
+        
+        # Split data based on Vendor K3 Amount into three categories
+        invoice_mask = df[vendor_k3_column] > 0
+        credit_note_mask = df[vendor_k3_column] < 0
+        zero_mask = df[vendor_k3_column] == 0
+        
+        invoice_df = df[invoice_mask].copy()
+        credit_note_df = df[credit_note_mask].copy()
+        zero_df = df[zero_mask].copy()
+        
+        logger.info(f"Split results: Invoice (>0): {len(invoice_df)} rows, Credit_Note (<0): {len(credit_note_df)} rows, Zero (==0): {len(zero_df)} rows")
+        
+        # Write all sheets to a single Excel file
+        with pd.ExcelWriter(output_file_path, engine='xlsxwriter') as writer:
+            if len(invoice_df) > 0:
+                invoice_df.to_excel(writer, sheet_name='Invoice', index=False)
+                logger.info(f"Invoice sheet written: {len(invoice_df)} rows")
+            else:
+                # Create empty sheet with headers
+                pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name='Invoice', index=False)
+                logger.info("Invoice sheet created (empty - no records)")
+            
+            if len(credit_note_df) > 0:
+                credit_note_df.to_excel(writer, sheet_name='Credit_Note', index=False)
+                logger.info(f"Credit_Note sheet written: {len(credit_note_df)} rows")
+            else:
+                pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name='Credit_Note', index=False)
+                logger.info("Credit_Note sheet created (empty - no records)")
+            
+            if len(zero_df) > 0:
+                zero_df.to_excel(writer, sheet_name='Zero', index=False)
+                logger.info(f"Zero sheet written: {len(zero_df)} rows")
+            else:
+                pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name='Zero', index=False)
+                logger.info("Zero sheet created (empty - no records)")
+        
+        logger.info(f"Split data saved to single file with sheets: {output_file_path}")
+        return output_file_path
+        
+    except Exception as e:
+        logger.error(f"Error splitting data into sheets from {input_file_path}: {e}")
+        return None
+
+
+def split_dataframe_to_sheets(
+    df: pd.DataFrame,
+    output_file_path: str,
+    vendor_k3_column: str = 'Vendor K3 Amount'
+) -> Optional[str]:
+    """
+    Split a DataFrame into three sheets in a single Excel file based on Vendor K3 Amount.
+    - Invoice sheet: Vendor K3 Amount > 0
+    - Credit_Note sheet: Vendor K3 Amount < 0
+    - Zero sheet: Vendor K3 Amount == 0
+    
+    Args:
+        df: DataFrame to split
+        output_file_path: Path for output Excel file
+        vendor_k3_column: Name of the column containing Vendor K3 Amount
+    
+    Returns:
+        Output file path if successful, None if error
+    """
+    try:
+        if df.empty:
+            logger.warning("DataFrame is empty, nothing to split")
+            return None
+        
+        # Check if required column exists
+        if vendor_k3_column not in df.columns:
+            logger.error(f"Column '{vendor_k3_column}' not found in DataFrame. Available columns: {list(df.columns)}")
+            return None
+        
+        # Convert column to numeric, handling any non-numeric values
+        df[vendor_k3_column] = pd.to_numeric(df[vendor_k3_column], errors='coerce')
+        
+        # Split data based on Vendor K3 Amount into three categories
+        invoice_mask = df[vendor_k3_column] > 0
+        credit_note_mask = df[vendor_k3_column] < 0
+        zero_mask = df[vendor_k3_column] == 0
+        
+        invoice_df = df[invoice_mask].copy()
+        credit_note_df = df[credit_note_mask].copy()
+        zero_df = df[zero_mask].copy()
+        
+        logger.info(f"Split results: Invoice (>0): {len(invoice_df)} rows, Credit_Note (<0): {len(credit_note_df)} rows, Zero (==0): {len(zero_df)} rows")
+        
+        # Write all sheets to a single Excel file
+        with pd.ExcelWriter(output_file_path, engine='xlsxwriter') as writer:
+            if len(invoice_df) > 0:
+                invoice_df.to_excel(writer, sheet_name='Invoice', index=False)
+                logger.info(f"Invoice sheet written: {len(invoice_df)} rows")
+            else:
+                pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name='Invoice', index=False)
+                logger.info("Invoice sheet created (empty - no records)")
+            
+            if len(credit_note_df) > 0:
+                credit_note_df.to_excel(writer, sheet_name='Credit_Note', index=False)
+                logger.info(f"Credit_Note sheet written: {len(credit_note_df)} rows")
+            else:
+                pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name='Credit_Note', index=False)
+                logger.info("Credit_Note sheet created (empty - no records)")
+            
+            if len(zero_df) > 0:
+                zero_df.to_excel(writer, sheet_name='Zero', index=False)
+                logger.info(f"Zero sheet written: {len(zero_df)} rows")
+            else:
+                pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name='Zero', index=False)
+                logger.info("Zero sheet created (empty - no records)")
+        
+        logger.info(f"Split data saved to single file with sheets: {output_file_path}")
+        return output_file_path
+        
+    except Exception as e:
+        logger.error(f"Error splitting DataFrame into sheets: {e}")
+        return None
