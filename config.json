@@ -29,7 +29,8 @@
     "possible_reference_combinations": [
         ["PNR_Number", "Airline_Code", "Travel_Sector"],
         ["PNR_Number", "Travel_Sector"],
-        ["Ticket_Number", "Travel_Sector"]
+        ["Ticket_Number", "Travel_Sector"],
+        ["Ticket_Number"]
     ],
     "processing": {
         "batch_size": 100,
@@ -43,7 +44,7 @@
     },
     "scheduling": {
         "enabled": true,
-        "time": "11:21:30",
+        "time": "16:38:10",
         "timezone": "IST"
     },
     "paths": {

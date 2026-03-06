@@ -26,6 +26,7 @@ from data_splitter import split_by_vendor_k3_amount
 from invoice_deduplicator import process_multiple_files
 from gstr_2b_3b_merger import merge_gstr_data
 from fcm_parser import is_fcm_file, parse_fcm_sector, parse_fcm_pnr_or_ticket, generate_fcm_ticket_variations
+from booking_date_normalizer import normalize_excel_booking_date, normalize_db_booking_date
 
 # Configure enhanced logging for automated execution
 log_file = f"data_merge_{datetime.now().strftime('%Y%m%d')}.log"
@@ -681,10 +682,13 @@ class DataEnricher:
     
     def get_fcm_ticket_variations(self, ticket_value: str) -> List[str]:
         """
-        Get all ticket number variations for FCM files.
-        For non-FCM files or empty values, returns the original value in a list.
+        Get all ticket number variations.
         
-        For FCM files, generates variations with prefixes:
+        For all files:
+        - If ticket number length > 10, includes both original and version with dash
+          at position (length-10). Example: '1252791614965' -> ['1252791614965', '125-2791614965']
+        
+        For FCM files, additionally generates variations with prefixes:
         607, 098, 176, 125, 057, 074, 157, 220
         
         Each prefix is tried both with and without a dash separator.
@@ -698,14 +702,32 @@ class DataEnricher:
         Example (for FCM files):
             get_fcm_ticket_variations('2790431640') returns:
             ['2790431640', '6072790431640', '607-2790431640', '0982790431640', ...]
+        Example (for non-FCM files with long ticket):
+            get_fcm_ticket_variations('1252791614965') returns:
+            ['1252791614965', '125-2791614965']
         """
         # Check if current file is an FCM file
         if self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
-            # Use FCM parser to generate variations
+            # Use FCM parser to generate variations (includes dash logic for length > 10)
             return generate_fcm_ticket_variations(ticket_value)
         
-        # For non-FCM files, return original value only
-        return [ticket_value]
+        # For non-FCM files, apply dash logic for long ticket numbers
+        if not ticket_value or not isinstance(ticket_value, str):
+            return [str(ticket_value) if ticket_value else '']
+        
+        ticket_value = ticket_value.strip()
+        if not ticket_value:
+            return ['']
+        
+        variations = [ticket_value]
+        
+        # If ticket number length > 10, add version with dash at position (length-10)
+        if len(ticket_value) > 10:
+            dash_position = len(ticket_value) - 10
+            ticket_with_dash = f"{ticket_value[:dash_position]}-{ticket_value[dash_position:]}"
+            variations.append(ticket_with_dash)
+        
+        return variations
     
     def create_dynamic_query(self, reference_columns: List[str], params: List) -> str:
         """
@@ -1076,8 +1098,8 @@ class DataEnricher:
                             base_values.append(value)
                         
                         if valid_for_sector:
-                            # For FCM files with Ticket_Number, generate variations
-                            if ticket_index is not None and self.current_file_path and is_fcm_file(os.path.basename(self.current_file_path)):
+                            # For all files with Ticket_Number, generate variations (including dash logic for length > 10)
+                            if ticket_index is not None:
                                 ticket_variations = self.get_fcm_ticket_variations(base_values[ticket_index])
                                 # Create a key for each ticket variation
                                 for ticket_var in ticket_variations:
@@ -1085,7 +1107,7 @@ class DataEnricher:
                                     varied_values[ticket_index] = ticket_var
                                     key_values_list.append(tuple(varied_values))
                             else:
-                                # Non-FCM or no Ticket_Number: use single key
+                                # No Ticket_Number in this combination: use single key
                                 key_values_list.append(tuple(base_values))
                     
                     if key_values_list:
@@ -1226,7 +1248,191 @@ class DataEnricher:
                                 }
                                 unmatched_indices.remove(idx)
                                 combination_usage_stats[str(combination)] += 1
-            
+#pnr bookingdate logic start            
+            # PRIORITY Fallback: Try PNR_Number + Booking_Date matching FIRST (before other fallbacks)
+            # This runs right after the main cascade to catch rows with valid PNR but non-matching Travel_Sector
+            if unmatched_indices:
+                logger.info(f"Trying PNR_Number + Booking_Date matching for {len(unmatched_indices)} unmatched rows (priority fallback)")
+                
+                # Find PNR_Number column in Excel
+                pnr_excel_col_priority = None
+                for excel_name, db_name in excel_to_db_mapping.items():
+                    if db_name == 'PNR_Number':
+                        pnr_excel_col_priority = excel_name
+                        break
+                if pnr_excel_col_priority is None:
+                    for col in df_excel.columns:
+                        if col.lower().strip() in ['pnr', 'pnr number', 'pnrnumber', 'airline pnr', 'airlne pnr', 'airline pnr/prov. booking']:
+                            pnr_excel_col_priority = col
+                            break
+                
+                # Find Booking_Date column in Excel
+                booking_date_col_priority = None
+                booking_date_names_priority = ['Booking Date', 'booking date', 'BookingDate', 'Booking_Date', 'booking_date']
+                for col in df_excel.columns:
+                    if col in booking_date_names_priority or col.lower().strip() in [n.lower() for n in booking_date_names_priority]:
+                        booking_date_col_priority = col
+                        break
+                
+                if pnr_excel_col_priority and booking_date_col_priority:
+                    logger.info(f"PNR+Booking_Date priority: PNR column='{pnr_excel_col_priority}', Booking_Date column='{booking_date_col_priority}'")
+                    
+                    # Build keys
+                    row_keys_priority = {}
+                    rows_valid_priority = []
+                    excel_dates_priority = {}
+                    skip_empty_pnr = 0
+                    skip_empty_date = 0
+                    skip_parse_fail = 0
+                    
+                    for idx in list(unmatched_indices):
+                        row = batch_df.loc[idx]
+                        
+                        if pnr_excel_col_priority not in row.index:
+                            continue
+                        
+                        pnr_val = row[pnr_excel_col_priority]
+                        pnr_val = self.normalize_pnr_ticket_value(pnr_val, 'PNR_Number')
+                        if self.is_empty_value(pnr_val):
+                            skip_empty_pnr += 1
+                            continue
+                        
+                        if booking_date_col_priority not in row.index:
+                            continue
+                        
+                        date_val = row[booking_date_col_priority]
+                        if self.is_empty_value(date_val):
+                            skip_empty_date += 1
+                            continue
+                        
+                        normalized_date = normalize_excel_booking_date(date_val)
+                        if normalized_date is None:
+                            skip_parse_fail += 1
+                            logger.info(f"Priority fallback row {idx}: Date parse failed: {date_val!r} (type: {type(date_val).__name__}), PNR: {pnr_val}")
+                            continue
+                        
+                        excel_dates_priority[idx] = normalized_date
+                        pnr_variations = self.get_fcm_ticket_variations(pnr_val)
+                        
+                        if pnr_variations:
+                            row_keys_priority[idx] = pnr_variations
+                            rows_valid_priority.append(idx)
+                    
+                    logger.info(f"PNR+Booking_Date priority: {len(rows_valid_priority)} rows with valid keys (skipped: {skip_empty_pnr} empty PNR, {skip_empty_date} empty date, {skip_parse_fail} parse failures)")
+                    
+                    if row_keys_priority:
+                        # Collect all PNR values
+                        all_pnrs = []
+                        pnr_to_indices = {}
+                        pnr_to_pattern_p = {}
+                        
+                        for idx, pnr_list in row_keys_priority.items():
+                            inv_pattern = None
+                            if vendor_invoice_col and vendor_invoice_col in batch_df.loc[idx].index:
+                                inv_val = batch_df.loc[idx, vendor_invoice_col]
+                                if not self.is_empty_value(inv_val):
+                                    inv_str = str(inv_val).strip().upper()
+                                    if inv_str.startswith('CN'):
+                                        inv_pattern = 'CN'
+                                    elif inv_str.startswith('IN'):
+                                        inv_pattern = 'IN'
+                            
+                            for pnr in pnr_list:
+                                if pnr not in pnr_to_indices:
+                                    all_pnrs.append(pnr)
+                                    pnr_to_indices[pnr] = []
+                                    pnr_to_pattern_p[pnr] = None
+                                pnr_to_indices[pnr].append(idx)
+                                if inv_pattern and pnr_to_pattern_p[pnr] is None:
+                                    pnr_to_pattern_p[pnr] = inv_pattern
+                        
+                        unique_pnrs = list(dict.fromkeys(all_pnrs))
+                        logger.info(f"PNR+Booking_Date priority: Querying DB for {len(unique_pnrs)} unique PNR values")
+                        
+                        # Query DB
+                        cols_with_booking = list(missing_columns) + ['Booking_Date'] if 'Booking_Date' not in missing_columns else list(missing_columns)
+                        cols_str = ', '.join([f"`{c}`" for c in cols_with_booking])
+                        placeholders = ', '.join(['%s' for _ in unique_pnrs])
+                        
+                        query = (
+                            f"SELECT `PNR_Number`, {cols_str} "
+                            f"FROM `{table_name}` "
+                            f"WHERE `PNR_Number` IN ({placeholders}) "
+                            f"AND `PNR_Number` IS NOT NULL "
+                            f"ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        )
+                        
+                        results = self.execute_query_with_retry(query, unique_pnrs)
+                        logger.info(f"PNR+Booking_Date priority: Got {len(results)} results from DB")
+                        
+                        # Group by PNR
+                        results_by_pnr = {}
+                        for r in results:
+                            pnr_key = r.get('PNR_Number')
+                            if pnr_key not in results_by_pnr:
+                                results_by_pnr[pnr_key] = []
+                            
+                            db_date = r.get('Booking_Date')
+                            norm_db_date = normalize_db_booking_date(db_date)
+                            
+                            result_data = {c: r.get(c) for c in missing_columns}
+                            result_data['_norm_date'] = norm_db_date
+                            result_data['_raw_date'] = db_date
+                            results_by_pnr[pnr_key].append(result_data)
+                        
+                        # Match
+                        matches_found = 0
+                        for idx in rows_valid_priority:
+                            if idx in unmatched_indices:
+                                pnr_list = row_keys_priority[idx]
+                                excel_date = excel_dates_priority.get(idx)
+                                
+                                if excel_date is None:
+                                    continue
+                                
+                                matched_results = []
+                                matched_pnr = None
+                                
+                                for pnr in pnr_list:
+                                    if pnr in results_by_pnr:
+                                        pattern = pnr_to_pattern_p.get(pnr)
+                                        
+                                        for res in results_by_pnr[pnr]:
+                                            db_date = res.get('_norm_date')
+                                            
+                                            if excel_date == db_date:
+                                                orig_inv = res.get('Original_Invoice_Number')
+                                                
+                                                if pattern == 'CN' and self.is_empty_value(orig_inv):
+                                                    continue
+                                                elif pattern == 'IN' and not self.is_empty_value(orig_inv):
+                                                    continue
+                                                
+                                                result_copy = {k: v for k, v in res.items() if not k.startswith('_')}
+                                                matched_results.append(result_copy)
+                                                matched_pnr = pnr
+                                                break
+                                    
+                                    if matched_results:
+                                        break
+                                
+                                if matched_results:
+                                    row_matches[idx] = {
+                                        'matched_data_list': matched_results,
+                                        'combination': ['PNR_Number', 'Booking_Date']
+                                    }
+                                    unmatched_indices.remove(idx)
+                                    matches_found += 1
+                                    combination_usage_stats["PNR_Number_Booking_Date (priority)"] = combination_usage_stats.get("PNR_Number_Booking_Date (priority)", 0) + 1
+                                    logger.debug(f"Priority matched row {idx}: PNR={matched_pnr}, Date={excel_date}")
+                        
+                        logger.info(f"PNR+Booking_Date priority: {matches_found} matches found")
+                else:
+                    if not pnr_excel_col_priority:
+                        logger.info("PNR+Booking_Date priority skipped: PNR column not found")
+                    if not booking_date_col_priority:
+                        logger.info("PNR+Booking_Date priority skipped: Booking_Date column not found")
+#pnrbookingdate logic end 1            
             # Fallback: Try first-last sector pattern for unmatched rows
             # This matches patterns like "MAA-HYD-BBI" with "MAA-BBI" in the database
             if unmatched_indices and sector_excel_col:
@@ -1490,8 +1696,8 @@ class DataEnricher:
                         # Build keys for each sector using Ticket_Number as PNR_Number
                         # For FCM files, also try with prefix variations
                         key_values_list_ticket = []
-                        
-                        # Get ticket variations (for FCM files, returns multiple; for others, returns original only)
+
+                        # Get ticket variations (includes dash variation for length > 10, plus FCM prefixes if applicable)
                         ticket_variations = self.get_fcm_ticket_variations(ticket_value)
                         
                         for sector in sectors_to_query_ticket:
@@ -1624,7 +1830,229 @@ class DataEnricher:
                                     unmatched_indices.remove(idx)
                                     combination_usage_stats["Ticket_Number_as_PNR_Number (fallback)"] = combination_usage_stats.get("Ticket_Number_as_PNR_Number (fallback)", 0) + 1
                                     logger.debug(f"Matched row {idx} using Ticket_Number value as PNR_Number: {ticket_value}")
-            
+#pnrbookingdate logic start2            
+            # Fallback: Try PNR_Number + Booking_Date matching with date normalization
+            # This handles cases where Travel_Sector doesn't match but PNR and Booking Date do
+            if unmatched_indices:
+                logger.info(f"Trying PNR_Number + Booking_Date fallback for {len(unmatched_indices)} unmatched rows")
+                
+                # Find PNR_Number column in Excel
+                pnr_excel_col_for_date = None
+                for excel_name, db_name in excel_to_db_mapping.items():
+                    if db_name == 'PNR_Number':
+                        pnr_excel_col_for_date = excel_name
+                        break
+                if pnr_excel_col_for_date is None:
+                    for col in df_excel.columns:
+                        # Include 'airlne pnr' (typo in some files) and other variants
+                        if col.lower().strip() in ['pnr', 'pnr number', 'pnrnumber', 'airline pnr', 'airlne pnr', 'airline pnr/prov. booking']:
+                            pnr_excel_col_for_date = col
+                            break
+                
+                # Find Booking_Date column in Excel
+                booking_date_excel_col = None
+                booking_date_col_names = ['Booking Date', 'booking date', 'BookingDate', 'Booking_Date', 'booking_date']
+                for col in df_excel.columns:
+                    if col in booking_date_col_names or col.lower().strip() in [n.lower() for n in booking_date_col_names]:
+                        booking_date_excel_col = col
+                        break
+                
+                logger.info(f"PNR+Booking_Date fallback: PNR column='{pnr_excel_col_for_date}', Booking_Date column='{booking_date_excel_col}'")
+                
+                # Only proceed if we have both PNR_Number and Booking_Date columns
+                if pnr_excel_col_for_date and booking_date_excel_col:
+                    # Build keys using PNR_Number and normalized Booking_Date
+                    row_keys_pnr_date = {}
+                    rows_with_valid_keys_pnr_date = []
+                    excel_normalized_dates = {}  # Store normalized dates for matching
+                    skipped_empty_pnr = 0
+                    skipped_empty_date = 0
+                    skipped_parse_fail = 0
+                    
+                    for idx in list(unmatched_indices):
+                        row = batch_df.loc[idx]
+                        
+                        # Get PNR_Number value
+                        if pnr_excel_col_for_date not in row.index:
+                            continue
+                        
+                        pnr_value = row[pnr_excel_col_for_date]
+                        # Normalize PNR value
+                        pnr_value = self.normalize_pnr_ticket_value(pnr_value, 'PNR_Number')
+                        if self.is_empty_value(pnr_value):
+                            skipped_empty_pnr += 1
+                            continue
+                        
+                        # Get Booking_Date value
+                        if booking_date_excel_col not in row.index:
+                            continue
+                        
+                        booking_date_value = row[booking_date_excel_col]
+                        if self.is_empty_value(booking_date_value):
+                            skipped_empty_date += 1
+                            continue
+                        
+                        # Normalize Excel booking date to canonical YYYY-MM-DD
+                        normalized_excel_date = normalize_excel_booking_date(booking_date_value)
+                        if normalized_excel_date is None:
+                            skipped_parse_fail += 1
+                            # Log at INFO level for visibility
+                            logger.info(f"Row {idx}: Failed to parse Excel booking date: {booking_date_value!r} (type: {type(booking_date_value).__name__}), PNR: {pnr_value}")
+                            continue
+                        
+                        # Store the normalized date for later matching
+                        excel_normalized_dates[idx] = normalized_excel_date
+                        
+                        # For FCM files, also try with prefix variations
+                        pnr_variations = self.get_fcm_ticket_variations(pnr_value)
+                        
+                        if pnr_variations:
+                            row_keys_pnr_date[idx] = pnr_variations
+                            rows_with_valid_keys_pnr_date.append(idx)
+                    
+                    logger.info(f"PNR+Booking_Date fallback: {len(rows_with_valid_keys_pnr_date)} rows with valid keys (skipped: {skipped_empty_pnr} empty PNR, {skipped_empty_date} empty date, {skipped_parse_fail} parse failures)")
+                    
+                    # If we have valid rows, execute batch query using PNR_Number only, then filter by Booking_Date
+                    if row_keys_pnr_date:
+                        # Collect all unique PNR values
+                        all_pnr_values = []
+                        pnr_to_row_indices = {}
+                        pnr_to_pattern = {}  # Map PNR -> 'CN' or 'IN' pattern based on GST INVOICE NO
+                        
+                        for idx, pnr_list in row_keys_pnr_date.items():
+                            # Get GST INVOICE NO pattern for this row
+                            invoice_pattern = None
+                            if vendor_invoice_col and vendor_invoice_col in batch_df.loc[idx].index:
+                                vendor_invoice_val = batch_df.loc[idx, vendor_invoice_col]
+                                if not self.is_empty_value(vendor_invoice_val):
+                                    vendor_invoice_str = str(vendor_invoice_val).strip().upper()
+                                    if vendor_invoice_str.startswith('CN'):
+                                        invoice_pattern = 'CN'
+                                    elif vendor_invoice_str.startswith('IN'):
+                                        invoice_pattern = 'IN'
+                            
+                            for pnr in pnr_list:
+                                if pnr not in pnr_to_row_indices:
+                                    all_pnr_values.append(pnr)
+                                    pnr_to_row_indices[pnr] = []
+                                    pnr_to_pattern[pnr] = None
+                                pnr_to_row_indices[pnr].append(idx)
+                                if invoice_pattern and pnr_to_pattern[pnr] is None:
+                                    pnr_to_pattern[pnr] = invoice_pattern
+                        
+                        unique_pnr_values = list(dict.fromkeys(all_pnr_values))
+                        logger.info(f"PNR+Booking_Date fallback: Querying DB for {len(unique_pnr_values)} unique PNR values")
+                        
+                        # Build batch query using PNR_Number only, also fetch Booking_Date from DB
+                        missing_cols_with_booking = list(missing_columns) + ['Booking_Date'] if 'Booking_Date' not in missing_columns else list(missing_columns)
+                        missing_columns_str_pnr_date = ', '.join([f"`{col}`" for col in missing_cols_with_booking])
+                        placeholders_pnr = ', '.join(['%s' for _ in unique_pnr_values])
+                        
+                        # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
+                        order_by_clause_pnr_date = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        
+                        query_pnr_date = (
+                            f"SELECT `PNR_Number`, {missing_columns_str_pnr_date} "
+                            f"FROM `{table_name}` "
+                            f"WHERE `PNR_Number` IN ({placeholders_pnr}) "
+                            f"AND `PNR_Number` IS NOT NULL "
+                            f"{order_by_clause_pnr_date}"
+                        )
+                        params_pnr_date = unique_pnr_values
+                        
+                        # Execute batch query
+                        results_pnr_date = self.execute_query_with_retry(query_pnr_date, params_pnr_date)
+                        logger.info(f"PNR+Booking_Date fallback: Got {len(results_pnr_date)} results from DB")
+                        
+                        # Group results by PNR and normalized Booking_Date
+                        results_by_pnr = {}
+                        db_date_parse_failures = 0
+                        for r in results_pnr_date:
+                            pnr_key = r.get('PNR_Number')
+                            if pnr_key not in results_by_pnr:
+                                results_by_pnr[pnr_key] = []
+                            
+                            # Normalize DB booking date for comparison
+                            db_booking_date = r.get('Booking_Date')
+                            normalized_db_date = normalize_db_booking_date(db_booking_date)
+                            if normalized_db_date is None and db_booking_date is not None:
+                                db_date_parse_failures += 1
+                                logger.debug(f"DB date parse failure: PNR={pnr_key}, Booking_Date={db_booking_date!r} (type: {type(db_booking_date).__name__})")
+                            
+                            result_data = {col: r.get(col) for col in missing_columns}
+                            result_data['_normalized_booking_date'] = normalized_db_date
+                            result_data['_raw_db_booking_date'] = db_booking_date
+                            results_by_pnr[pnr_key].append(result_data)
+                        
+                        if db_date_parse_failures > 0:
+                            logger.info(f"PNR+Booking_Date fallback: {db_date_parse_failures} DB date parse failures")
+                        
+                        # Match rows by comparing normalized dates
+                        matches_found = 0
+                        date_mismatches = 0
+                        for idx in rows_with_valid_keys_pnr_date:
+                            if idx in unmatched_indices:
+                                pnr_list = row_keys_pnr_date[idx]
+                                excel_normalized = excel_normalized_dates.get(idx)
+                                
+                                if excel_normalized is None:
+                                    continue
+                                
+                                all_results_pnr_date = []
+                                matched_pnr = None
+                                
+                                # Look for matches across all PNR variations
+                                for pnr in pnr_list:
+                                    if pnr in results_by_pnr:
+                                        pattern = pnr_to_pattern.get(pnr)
+                                        
+                                        for result in results_by_pnr[pnr]:
+                                            db_normalized = result.get('_normalized_booking_date')
+                                            
+                                            # Check if dates match
+                                            if excel_normalized == db_normalized:
+                                                # Apply CN/IN filtering
+                                                original_inv_num = result.get('Original_Invoice_Number')
+                                                
+                                                if pattern == 'CN':
+                                                    if self.is_empty_value(original_inv_num):
+                                                        continue  # Skip if CN but no Original_Invoice_Number
+                                                elif pattern == 'IN':
+                                                    if not self.is_empty_value(original_inv_num):
+                                                        continue  # Skip if IN but has Original_Invoice_Number
+                                                
+                                                # Remove internal key before storing
+                                                result_copy = {k: v for k, v in result.items() if not k.startswith('_')}
+                                                all_results_pnr_date.append(result_copy)
+                                                matched_pnr = pnr
+                                                break  # Take first matching result per PNR
+                                            else:
+                                                # Log date mismatch for debugging
+                                                if date_mismatches < 5:  # Only log first 5 mismatches
+                                                    raw_db_date = result.get('_raw_db_booking_date')
+                                                    logger.debug(f"Date mismatch for PNR {pnr}: Excel={excel_normalized}, DB={db_normalized} (raw: {raw_db_date!r})")
+                                                date_mismatches += 1
+                                    
+                                    if all_results_pnr_date:
+                                        break  # Found a match, stop looking
+                                
+                                if all_results_pnr_date:
+                                    row_matches[idx] = {
+                                        'matched_data_list': all_results_pnr_date,
+                                        'combination': ['PNR_Number', 'Booking_Date']
+                                    }
+                                    unmatched_indices.remove(idx)
+                                    matches_found += 1
+                                    combination_usage_stats["PNR_Number_Booking_Date (fallback)"] = combination_usage_stats.get("PNR_Number_Booking_Date (fallback)", 0) + 1
+                                    logger.debug(f"Matched row {idx} using PNR_Number + Booking_Date: {matched_pnr}, {excel_normalized}")
+                        
+                        logger.info(f"PNR+Booking_Date fallback: {matches_found} matches found, {date_mismatches} date mismatches")
+                else:
+                    if not pnr_excel_col_for_date:
+                        logger.info("PNR_Number + Booking_Date fallback skipped: PNR column not found in Excel")
+                    if not booking_date_excel_col:
+                        logger.info("PNR_Number + Booking_Date fallback skipped: Booking_Date column not found in Excel")
+#pnrbookingdate logic end2            
             # Build enriched rows in original order (preserve exact row sequence)
             # Iterate by position to ensure order is maintained
             for pos in range(len(batch_df)):

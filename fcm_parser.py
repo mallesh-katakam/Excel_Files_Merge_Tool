@@ -157,6 +157,10 @@ def generate_fcm_ticket_variations(ticket_number: str) -> List[str]:
     This function generates all possible variations to try when looking up 
     ticket numbers in the database.
     
+    Special handling for ticket numbers > 10 characters:
+    - If length > 10, generates both original and version with dash at position (length-10)
+    - Example: '1252791614965' (13 chars) -> '1252791614965' and '125-2791614965'
+    
     Prefixes to try: 607, 098, 176, 125, 057, 074, 157, 220
     
     Each prefix is tried in two formats:
@@ -169,12 +173,15 @@ def generate_fcm_ticket_variations(ticket_number: str) -> List[str]:
     Returns:
         List of ticket number variations including:
         - Original ticket number (first in list)
+        - Dash-inserted version if length > 10
         - All prefix variations (with and without dashes)
         
     Example:
         >>> generate_fcm_ticket_variations('2790431640')
         ['2790431640', '6072790431640', '607-2790431640', '0982790431640', 
          '098-2790431640', '1762790431640', '176-2790431640', ...]
+        >>> generate_fcm_ticket_variations('1252791614965')
+        ['1252791614965', '125-2791614965', '6071252791614965', ...]
     """
     if not ticket_number or not isinstance(ticket_number, str):
         return [str(ticket_number) if ticket_number else '']
@@ -184,10 +191,17 @@ def generate_fcm_ticket_variations(ticket_number: str) -> List[str]:
         return ['']
     
     # Define prefixes to try
-    prefixes = ['607', '098', '176', '125', '057', '074', '157', '220']
+    prefixes = ['607', '098', '176', '125', '057', '074', '157', '220', '160', '232', '618', '217', '235', '932']
     
     # Start with original ticket number
     variations = [ticket_number]
+    
+    # If ticket number length > 10, add version with dash at position (length-10)
+    if len(ticket_number) > 10:
+        dash_position = len(ticket_number) - 10
+        ticket_with_dash = f"{ticket_number[:dash_position]}-{ticket_number[dash_position:]}"
+        variations.append(ticket_with_dash)
+        logger.debug(f"Ticket length > 10: Added dash variation '{ticket_with_dash}'")
     
     # Generate variations with each prefix
     for prefix in prefixes:
