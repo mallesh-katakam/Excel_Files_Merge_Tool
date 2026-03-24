@@ -4,4 +4,5 @@ schedule>=1.1.0
 openpyxl>=3.0.0
 xlsxwriter>=3.0.0
 paramiko>=2.9.0
+boto3>=1.26.0
 pyxlsb>=1.0.0

@@ -17,7 +17,8 @@ import threading
 from datetime import datetime
 import json
 import paramiko
-import smtplib
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -2500,20 +2501,36 @@ class SFTPDownloader:
 
 
 class EmailSender:
-    """Handles sending email notifications after processing."""
+    """Handles sending email notifications via AWS SES."""
     
     def __init__(self, config: Dict):
         self.config = config
         self.enabled = config.get("enabled", False)
         self.recipient = config.get("recipient_email", "")
-        self.smtp_server = config.get("smtp_server", "smtp.gmail.com")
-        self.smtp_port = config.get("smtp_port", 587)
         self.sender_email = config.get("sender_email", "")
-        self.sender_password = config.get("sender_password", "")
         self.subject = config.get("subject", "Data Merge Processing Report")
+        self.aws_region = config.get("aws_region", "us-south-1")
+        self.aws_access_key_id = config.get("aws_access_key_id", "")
+        self.aws_secret_access_key = config.get("aws_secret_access_key", "")
+        self.ses_client = None
+    
+    def _get_ses_client(self):
+        """Create and return a boto3 SES client."""
+        if self.ses_client is None:
+            try:
+                kwargs = {"region_name": self.aws_region}
+                if self.aws_access_key_id and self.aws_secret_access_key:
+                    kwargs["aws_access_key_id"] = self.aws_access_key_id
+                    kwargs["aws_secret_access_key"] = self.aws_secret_access_key
+                self.ses_client = boto3.client("ses", **kwargs)
+                logger.info(f"SES client initialized for region {self.aws_region}")
+            except (NoCredentialsError, BotoCoreError) as e:
+                logger.error(f"Failed to initialize SES client: {e}")
+                raise
+        return self.ses_client
     
     def send_email(self, processing_result: Dict, log_file_path: Optional[str] = None, output_files: Optional[List[str]] = None) -> bool:
-        """Send email notification with processing results."""
+        """Send email notification with processing results via AWS SES."""
         if not self.enabled:
             logger.info("Email notifications are disabled")
             return False
@@ -2523,17 +2540,14 @@ class EmailSender:
             return False
         
         try:
-            # Create email message
             msg = MIMEMultipart()
             msg['From'] = self.sender_email
             msg['To'] = self.recipient
             msg['Subject'] = self.subject
             
-            # Create email body
             body = self._create_email_body(processing_result)
             msg.attach(MIMEText(body, 'html'))
             
-            # Attach processed output files
             if output_files:
                 for file_path in output_files:
                     if file_path and os.path.exists(file_path):
@@ -2543,7 +2557,6 @@ class EmailSender:
                                 part.set_payload(attachment.read())
                             encoders.encode_base64(part)
                             
-                            # Determine MIME type based on file extension
                             file_ext = os.path.splitext(file_path)[1].lower()
                             if file_ext in ['.xlsx', '.xls', '.xlsb']:
                                 mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -2562,7 +2575,6 @@ class EmailSender:
                         except Exception as e:
                             logger.warning(f"Could not attach file {file_path}: {e}")
             
-            # Attach log file if available
             if log_file_path and os.path.exists(log_file_path):
                 try:
                     with open(log_file_path, 'rb') as attachment:
@@ -2579,17 +2591,27 @@ class EmailSender:
                 except Exception as e:
                     logger.warning(f"Could not attach log file: {e}")
             
-            # Send email
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.sender_email, self.sender_password)
-                server.send_message(msg)
+            ses = self._get_ses_client()
+            response = ses.send_raw_email(
+                Source=self.sender_email,
+                Destinations=[self.recipient],
+                RawMessage={"Data": msg.as_string()},
+            )
             
-            logger.info(f"Email sent successfully to {self.recipient}")
+            message_id = response.get("MessageId", "N/A")
+            logger.info(f"Email sent successfully to {self.recipient} (MessageId: {message_id})")
             return True
-            
+        
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            error_msg = e.response["Error"]["Message"]
+            logger.error(f"SES ClientError [{error_code}]: {error_msg}")
+            return False
+        except NoCredentialsError:
+            logger.error("AWS credentials not found. Run 'aws configure' to set up credentials.")
+            return False
         except Exception as e:
-            logger.error(f"Failed to send email: {e}")
+            logger.error(f"Failed to send email via SES: {e}")
             return False
     
     def _create_email_body(self, result: Dict) -> str:

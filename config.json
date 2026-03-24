@@ -61,12 +61,12 @@
     "local_download_dir": "C:\\Users\\sharm\\Downloads\\sftp_files"
   },
   "email": {
-    "enabled": false,
-    "recipient_email": "katakamkumar8@gmail.com",
-    "smtp_server": "smtp.gmail.com",
-    "smtp_port": 587,
-    "sender_email": "malleshkumar587@gmail.com",
-    "sender_password": "lqez wiqv zbhr dxlu",
+    "enabled": true,
+    "recipient_email": "mallesh.katakam@fastcollab.com",
+    "sender_email": "confirmation.dev@eva.travel",
+    "aws_region": "ap-south-1",
+    "aws_access_key_id": "",
+    "aws_secret_access_key": "",
     "subject": "Data Merge Processing Report"
   }
 }
