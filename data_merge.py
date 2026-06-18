@@ -1174,7 +1174,7 @@ class DataEnricher:
                     # For CN: prioritize NOT NULL, for IN: prioritize NULL
                     # Since we have mixed patterns, we'll use a general ordering and handle prioritization in code
                     # But we can still add ORDER BY to help with the prioritization
-                    order_by_clause = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                    order_by_clause = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC, `Created_Date` DESC"
                     
                     query = (
                         f"SELECT {ref_cols_str}, {missing_columns_str} "
@@ -1376,7 +1376,7 @@ class DataEnricher:
                             f"FROM `{table_name}` "
                             f"WHERE `PNR_Number` IN ({placeholders}) "
                             f"AND `PNR_Number` IS NOT NULL "
-                            f"ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                            f"ORDER BY `Original_Invoice_Number` IS NOT NULL DESC, `Created_Date` DESC"
                         )
                         
                         results = self.execute_query_with_retry(query, unique_pnrs)
@@ -1569,7 +1569,7 @@ class DataEnricher:
                         null_checks = ' AND '.join([f"`{c}` IS NOT NULL" for c in combination])
                         
                         # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
-                        order_by_clause = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        order_by_clause = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC, `Created_Date` DESC"
                         
                         query = (
                             f"SELECT {ref_cols_str}, {missing_columns_str} "
@@ -1767,7 +1767,7 @@ class DataEnricher:
                         null_checks_ticket = ' AND '.join([f"`{c}` IS NOT NULL" for c in pnr_sector_combination])
                         
                         # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
-                        order_by_clause_ticket = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        order_by_clause_ticket = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC, `Created_Date` DESC"
                         
                         query_ticket = (
                             f"SELECT {ref_cols_str_ticket}, {missing_columns_str_ticket} "
@@ -1966,7 +1966,7 @@ class DataEnricher:
                         placeholders_pnr = ', '.join(['%s' for _ in unique_pnr_values])
                         
                         # Add ORDER BY to prioritize Original_Invoice_Number based on pattern
-                        order_by_clause_pnr_date = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC"
+                        order_by_clause_pnr_date = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC, `Created_Date` DESC"
                         
                         query_pnr_date = (
                             f"SELECT `PNR_Number`, {missing_columns_str_pnr_date} "
