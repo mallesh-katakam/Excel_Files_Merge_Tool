@@ -426,6 +426,15 @@ class DataEnricher:
         # Return as-is for non-FCM files
         return value_str
     
+    def normalize_ref_column_value(self, ref_col: str, value):
+        """Normalize reference column values for DB matching."""
+        if ref_col == 'Invoice_Total' and not self.is_empty_value(value):
+            try:
+                return round(float(value), 2)
+            except (TypeError, ValueError):
+                pass
+        return value
+    
     def split_multi_sector(self, sector: str) -> List[str]:
         """
         Split multi-sector route into individual sectors by '/' separator.
@@ -1112,7 +1121,7 @@ class DataEnricher:
                                 valid_for_sector = False
                                 break
                             
-                            base_values.append(value)
+                            base_values.append(self.normalize_ref_column_value(ref_col, value))
                         
                         if valid_for_sector:
                             # For all files with Ticket_Number, generate variations (including dash logic for length > 10)
@@ -1201,7 +1210,7 @@ class DataEnricher:
                     # Group results by key first (multiple results per key possible)
                     results_by_key = {}
                     for r in results:
-                        key = tuple(r[c] for c in combination)
+                        key = tuple(self.normalize_ref_column_value(c, r[c]) for c in combination)
                         if key not in results_by_key:
                             results_by_key[key] = []
                         results_by_key[key].append({col: r.get(col) for col in missing_columns})
@@ -1523,7 +1532,7 @@ class DataEnricher:
                                 valid_for_sector = False
                                 break
                             
-                            key_values.append(value)
+                            key_values.append(self.normalize_ref_column_value(ref_col, value))
                         
                         if valid_for_sector:
                             row_keys_fallback[idx] = [tuple(key_values)]
@@ -1586,7 +1595,7 @@ class DataEnricher:
                         # Group results by key first (multiple results per key possible)
                         results_by_key_fallback = {}
                         for r in results_fallback:
-                            key = tuple(r[c] for c in combination)
+                            key = tuple(self.normalize_ref_column_value(c, r[c]) for c in combination)
                             if key not in results_by_key_fallback:
                                 results_by_key_fallback[key] = []
                             results_by_key_fallback[key].append({col: r.get(col) for col in missing_columns})

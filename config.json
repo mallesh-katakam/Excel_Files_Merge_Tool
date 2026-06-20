@@ -24,10 +24,12 @@
         "Ticket Num/Final Booking": "Ticket_Number",
         "Ticket Number": "Ticket_Number",
         "Airline Ticket No.": "Ticket_Number",
-        "ticketnumber": "Ticket_Number"
+        "ticketnumber": "Ticket_Number",
+        "Total Fare (Including GST)": "Invoice_Total",
+        "Gross Fare": "Invoice_Total"
     },
     "possible_reference_combinations": [
-        ["PNR_Number", "Airline_Code", "Travel_Sector"],
+        ["PNR_Number", "Travel_Sector", "Invoice_Total"],
         ["PNR_Number", "Travel_Sector"],
         ["Ticket_Number", "Travel_Sector"],
         ["Ticket_Number"]
