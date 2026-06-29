@@ -93,14 +93,11 @@ if ($existingTask) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-# Create the scheduled task
-$Action = New-ScheduledTaskAction -Execute $BatchPath -WorkingDirectory $WorkingDir
+# Create the scheduled task - run hidden (no CMD window)
+$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& '$BatchPath'`"" -WorkingDirectory $WorkingDir
 $Trigger = New-ScheduledTaskTrigger -Daily -At $scheduleTimeFormatted
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-
-# Use Interactive logon type for user tasks (doesn't require admin, but user must be logged in)
-# For tasks that run when user is NOT logged in, use LogonType Password (requires admin)
-$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -Hidden
+$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
 # Try to register the task
 try {
