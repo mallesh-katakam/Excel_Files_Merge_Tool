@@ -31,6 +31,7 @@
     "possible_reference_combinations": [
         ["PNR_Number", "Travel_Sector", "Invoice_Total"],
         ["PNR_Number", "Travel_Sector"],
+        ["Ticket_Number", "Travel_Sector", "Invoice_Total"],
         ["Ticket_Number", "Travel_Sector"],
         ["Ticket_Number"]
     ],

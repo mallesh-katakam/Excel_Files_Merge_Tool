@@ -1274,6 +1274,171 @@ class DataEnricher:
                                 }
                                 unmatched_indices.remove(idx)
                                 combination_usage_stats[str(combination)] += 1
+                
+                # After PNR_Number+Travel_Sector+Invoice_Total combo, try Ticket_Number as PNR for same combo
+                if combination == ['PNR_Number', 'Travel_Sector', 'Invoice_Total'] and unmatched_indices:
+                    logger.info(f"Trying Ticket_Number as PNR_Number + Sector + InvoiceTotal for {len(unmatched_indices)} unmatched rows")
+
+                    ticket_excel_col_strict = None
+                    for excel_name, db_name in excel_to_db_mapping.items():
+                        if db_name == 'Ticket_Number':
+                            ticket_excel_col_strict = excel_name
+                            break
+                    if ticket_excel_col_strict is None:
+                        for col in df_excel.columns:
+                            if col.lower().strip() in ['ticket number', 'ticketnumber', 'ticket_num', 'airline ticket no.', 'ticket num/final booking']:
+                                ticket_excel_col_strict = col
+                                break
+
+                    invoice_total_excel_col = None
+                    for excel_name, db_name in excel_to_db_mapping.items():
+                        if db_name == 'Invoice_Total':
+                            invoice_total_excel_col = excel_name
+                            break
+                    if invoice_total_excel_col is None:
+                        possible_invoice_names = ['Total Fare (Including GST)', 'total fare (including gst)', 'Total Fare', 'Gross Fare', 'gross fare']
+                        for col in df_excel.columns:
+                            if col.strip() in possible_invoice_names or col.lower().strip() in [n.lower() for n in possible_invoice_names]:
+                                invoice_total_excel_col = col
+                                break
+
+                    if ticket_excel_col_strict and sector_excel_col and invoice_total_excel_col:
+                        row_keys_strict = {}
+                        rows_valid_strict = []
+
+                        for idx in list(unmatched_indices):
+                            row = batch_df.loc[idx]
+
+                            if ticket_excel_col_strict not in row.index:
+                                continue
+                            ticket_value_s = row[ticket_excel_col_strict]
+                            ticket_value_s = self.normalize_pnr_ticket_value(ticket_value_s, 'Ticket_Number')
+                            if self.is_empty_value(ticket_value_s):
+                                continue
+
+                            if sector_excel_col not in row.index:
+                                continue
+                            sector_value_s = row[sector_excel_col]
+                            if self.is_empty_value(sector_value_s):
+                                continue
+
+                            if invoice_total_excel_col not in row.index:
+                                continue
+                            invoice_total_val = row[invoice_total_excel_col]
+                            if self.is_empty_value(invoice_total_val):
+                                continue
+                            invoice_total_normalized = self.normalize_ref_column_value('Invoice_Total', invoice_total_val)
+                            if invoice_total_normalized is None:
+                                continue
+
+                            sectors_strict = self.get_all_sector_combinations(sector_value_s)
+                            ticket_vars_strict = self.get_fcm_ticket_variations(ticket_value_s)
+
+                            key_list_strict = []
+                            for sector_s in sectors_strict:
+                                for tv in ticket_vars_strict:
+                                    key_list_strict.append((tv, sector_s, invoice_total_normalized))
+
+                            if key_list_strict:
+                                row_keys_strict[idx] = key_list_strict
+                                rows_valid_strict.append(idx)
+
+                        if row_keys_strict:
+                            pnr_sector_inv_combination = ['PNR_Number', 'Travel_Sector', 'Invoice_Total']
+                            all_keys_strict = []
+                            key_to_indices_strict = {}
+                            key_to_pattern_strict = {}
+
+                            for idx, keys_list in row_keys_strict.items():
+                                inv_pattern = None
+                                if vendor_invoice_col and vendor_invoice_col in batch_df.loc[idx].index:
+                                    vi_val = batch_df.loc[idx, vendor_invoice_col]
+                                    if not self.is_empty_value(vi_val):
+                                        vi_str = str(vi_val).strip().upper()
+                                        if vi_str.startswith('CN'):
+                                            inv_pattern = 'CN'
+                                        elif vi_str.startswith('IN'):
+                                            inv_pattern = 'IN'
+
+                                for key in keys_list:
+                                    if key not in key_to_indices_strict:
+                                        all_keys_strict.append(key)
+                                        key_to_indices_strict[key] = []
+                                        key_to_pattern_strict[key] = None
+                                    key_to_indices_strict[key].append(idx)
+                                    if inv_pattern and key_to_pattern_strict[key] is None:
+                                        key_to_pattern_strict[key] = inv_pattern
+
+                            unique_keys_strict = list(dict.fromkeys(all_keys_strict))
+
+                            ref_cols_str_s = ', '.join([f"`{c}`" for c in pnr_sector_inv_combination])
+                            missing_cols_str_s = ', '.join([f"`{col}`" for col in missing_columns])
+                            placeholders_s = ', '.join(["(" + ", ".join(["%s"] * len(pnr_sector_inv_combination)) + ")" for _ in unique_keys_strict])
+                            null_checks_s = ' AND '.join([f"`{c}` IS NOT NULL" for c in pnr_sector_inv_combination])
+                            order_by_s = "ORDER BY `Original_Invoice_Number` IS NOT NULL DESC, `Created_Date` DESC"
+
+                            query_s = (
+                                f"SELECT {ref_cols_str_s}, {missing_cols_str_s} "
+                                f"FROM `{table_name}` "
+                                f"WHERE ({ref_cols_str_s}) IN ({placeholders_s}) "
+                                f"AND {null_checks_s} "
+                                f"{order_by_s}"
+                            )
+                            params_s = [v for key in unique_keys_strict for v in key]
+
+                            results_strict = self.execute_query_with_retry(query_s, params_s)
+
+                            results_by_key_strict = {}
+                            for r in results_strict:
+                                key = tuple(self.normalize_ref_column_value(c, r[c]) for c in pnr_sector_inv_combination)
+                                if key not in results_by_key_strict:
+                                    results_by_key_strict[key] = []
+                                results_by_key_strict[key].append({col: r.get(col) for col in missing_columns})
+
+                            lookup_strict = {}
+                            for key in results_by_key_strict:
+                                key_results = results_by_key_strict[key]
+                                pattern = key_to_pattern_strict.get(key)
+
+                                if pattern == 'CN':
+                                    matched_result = None
+                                    for result in key_results:
+                                        original_inv_num = result.get('Original_Invoice_Number')
+                                        if not self.is_empty_value(original_inv_num):
+                                            matched_result = result
+                                            break
+                                    if matched_result is not None:
+                                        lookup_strict[key] = matched_result
+                                elif pattern == 'IN':
+                                    matched_result = None
+                                    for result in key_results:
+                                        original_inv_num = result.get('Original_Invoice_Number')
+                                        if self.is_empty_value(original_inv_num):
+                                            matched_result = result
+                                            break
+                                    if matched_result is not None:
+                                        lookup_strict[key] = matched_result
+                                else:
+                                    lookup_strict[key] = key_results[0]
+
+                            for idx in rows_valid_strict:
+                                if idx in unmatched_indices:
+                                    keys_list = row_keys_strict[idx]
+                                    all_results_strict = []
+                                    for key in keys_list:
+                                        if key in lookup_strict:
+                                            all_results_strict.append(lookup_strict[key])
+                                    if all_results_strict:
+                                        row_matches[idx] = {
+                                            'matched_data_list': all_results_strict,
+                                            'combination': ['PNR_Number', 'Travel_Sector', 'Invoice_Total']
+                                        }
+                                        unmatched_indices.remove(idx)
+                                        combination_usage_stats["Ticket_Number_as_PNR_Number+Sector+InvoiceTotal (fallback)"] = combination_usage_stats.get("Ticket_Number_as_PNR_Number+Sector+InvoiceTotal (fallback)", 0) + 1
+                                        logger.debug(f"Matched row {idx} using Ticket_Number as PNR_Number + Sector + InvoiceTotal")
+
+                            logger.info(f"Ticket_as_PNR+Sector+InvoiceTotal fallback: {combination_usage_stats.get('Ticket_Number_as_PNR_Number+Sector+InvoiceTotal (fallback)', 0)} matches found")
+
 #pnr bookingdate logic start            
             # PRIORITY Fallback: Try PNR_Number + Booking_Date matching FIRST (before other fallbacks)
             # This runs right after the main cascade to catch rows with valid PNR but non-matching Travel_Sector
